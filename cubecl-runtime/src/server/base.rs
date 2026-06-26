@@ -342,6 +342,7 @@ where
         _page_len: u64,
         _offset: u64,
         _size: u64,
+        _keepalive: alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
         _stream_id: StreamId,
     ) -> Handle {
         panic!("register_external_aliased is not supported by this backend");

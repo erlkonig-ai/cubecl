@@ -490,6 +490,7 @@ impl<R: Runtime> ComputeClient<R> {
         page_len: u64,
         offset: u64,
         size: u64,
+        keepalive: alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
     ) -> Handle {
         let stream_id = self.stream_id();
         // Raw pointers aren't `Send`; the safety contract above covers the hop to
@@ -504,7 +505,7 @@ impl<R: Runtime> ComputeClient<R> {
                 // (Send) rather than the raw `p.0` field (edition-2021 disjoint
                 // closure capture would otherwise make the closure non-Send).
                 let p = p;
-                server.register_external_aliased(p.0, page_len, offset, size, stream_id)
+                server.register_external_aliased(p.0, page_len, offset, size, keepalive, stream_id)
             })
             .unwrap()
     }
