@@ -12,6 +12,11 @@ const MIN_BUFFER_SIZE: u64 = 32;
 /// Buffer storage for wgpu.
 pub struct WgpuStorage {
     memory: HashMap<StorageId, wgpu::Buffer>,
+    /// Keep-alive anchors for externally-registered (aliasing) buffers: the
+    /// backing each aliases — e.g. an `anybytes` mmap owner — kept alive exactly
+    /// as long as the buffer, then dropped on `dealloc`. So an aliased buffer
+    /// *carries* its backing; nothing upstream has to manage that lifetime.
+    external_keepalives: HashMap<StorageId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     device: wgpu::Device,
     buffer_usages: BufferUsages,
     mem_alignment: usize,
@@ -67,6 +72,7 @@ impl WgpuStorage {
     pub fn new(mem_alignment: usize, device: wgpu::Device, usages: BufferUsages) -> Self {
         Self {
             memory: HashMap::new(),
+            external_keepalives: HashMap::new(),
             device,
             buffer_usages: usages,
             mem_alignment,
@@ -79,9 +85,16 @@ impl WgpuStorage {
     /// WITHOUT allocating. The buffer is owned by this storage from here on (it
     /// lives in the same `memory` map and is freed on `dealloc`). Pairs with
     /// `MemoryManagement::register_external` for zero-copy weight loading.
-    pub fn register_external(&mut self, buffer: wgpu::Buffer, offset: u64, size: u64) -> StorageHandle {
+    pub fn register_external(
+        &mut self,
+        buffer: wgpu::Buffer,
+        offset: u64,
+        size: u64,
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> StorageHandle {
         let id = StorageId::new();
         self.memory.insert(id, buffer);
+        self.external_keepalives.insert(id, keepalive);
         StorageHandle::new(id, StorageUtilization { offset, size })
     }
 
@@ -130,6 +143,8 @@ impl ComputeStorage for WgpuStorage {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     fn dealloc(&mut self, id: StorageId) {
         self.memory.remove(&id);
+        // Releasing the buffer releases its aliased backing (e.g. the mmap owner).
+        self.external_keepalives.remove(&id);
     }
 
     fn flush(&mut self) {

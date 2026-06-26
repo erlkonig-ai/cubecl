@@ -278,12 +278,13 @@ impl ComputeServer for WgpuServer {
         page_len: u64,
         offset: u64,
         size: u64,
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         stream_id: StreamId,
     ) -> cubecl_core::server::Handle {
         let stream = self.scheduler.stream(&stream_id);
         stream
             .mem_manage
-            .register_external_aliased(ptr, page_len, offset, size, stream_id)
+            .register_external_aliased(ptr, page_len, offset, size, keepalive, stream_id)
     }
 
     fn read(

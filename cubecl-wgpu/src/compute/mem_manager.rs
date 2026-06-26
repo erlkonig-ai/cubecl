@@ -127,13 +127,18 @@ impl WgpuMemManager {
         page_len: u64,
         offset: u64,
         size: u64,
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         stream_id: StreamId,
     ) -> cubecl_core::server::Handle {
         let device = self.memory_pool.storage().device().clone();
         // SAFETY: caller guarantees `ptr`/`page_len` is a live, page-aligned,
-        // immutable host region (mmap'd pile pages) outliving the handle.
+        // immutable host region (mmap'd pile pages) outliving the handle —
+        // `keepalive` (the backing's owner) enforces exactly that.
         let buffer = unsafe { make_aliased_buffer(&device, ptr, page_len) };
-        let storage_handle = self.memory_pool.storage().register_external(buffer, offset, size);
+        let storage_handle = self
+            .memory_pool
+            .storage()
+            .register_external(buffer, offset, size, keepalive);
         let mem = self.memory_pool.register_external(storage_handle);
         cubecl_core::server::Handle::from_memory(mem, stream_id, size)
     }
