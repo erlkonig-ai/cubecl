@@ -442,8 +442,23 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     /// reused, sub-sliced, or reclaimed — the caller owns the underlying storage
     /// lifetime. This is the zero-copy seam for weights-as-tribles: an mmap'd f16
     /// pile page becomes a GPU tensor with no copy and no allocation.
+    ///
+    /// The returned handle (and every clone of it) permanently reports
+    /// `can_mut() == false`: external storage aliases READ-ONLY host memory,
+    /// so it must never be picked as an in-place kernel destination. Burn's
+    /// elementwise kernels reuse an "owned" input handle as the output buffer
+    /// (`can_mut()` = a handle-count heuristic, `strong_count <= 2`); on a
+    /// read-only mmap the GPU's in-place write is silently dropped by the
+    /// pager and the op returns its INPUT bytes — e.g. voxtral's folded-ear
+    /// load saw `q.mul_scalar(1/sqrt(d))` come back unscaled (2026-07-12,
+    /// caught by the aliased-vs-materialized A/B being token-divergent).
+    /// Pinning two extra handle clones for the registration's life (external
+    /// entries are never removed anyway) pushes every user-facing clone over
+    /// the heuristic's threshold, forcing all consumers to allocate outputs.
     pub fn register_external(&mut self, storage: StorageHandle) -> ManagedMemoryHandle {
         let handle = ManagedMemoryHandle::new();
+        core::mem::forget(handle.clone());
+        core::mem::forget(handle.clone());
         self.external.insert(handle.descriptor().id.value, storage);
         handle
     }
