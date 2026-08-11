@@ -399,6 +399,20 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
 
     /// Returns the storage from the specified binding
     pub fn get_cursor(&self, binding: ManagedMemoryBinding) -> Result<u64, IoError> {
+        // External storage is registered rather than reserved: it has no
+        // `Slice`, so it has no cursor to read. Returning 0 is not a fallback,
+        // it is the right answer -- the cursor exists to order a read after the
+        // stream operation that last WROTE the memory, and external storage is
+        // pinned `can_mut() == false` precisely so that nothing ever writes it.
+        // There is no producing operation to wait for.
+        //
+        // Only the CUDA backend reaches this: its multi-stream scheduler calls
+        // `handle_cursor` on every binding, while the wgpu backend the seam was
+        // first written for has no cursors at all. That is why an external
+        // handle used to die here with "Memory page 0 doesn't exist".
+        if self.external.contains_key(&binding.descriptor().id.value) {
+            return Ok(0);
+        }
         let slice = self.find(binding)?;
         Ok(slice.cursor)
     }

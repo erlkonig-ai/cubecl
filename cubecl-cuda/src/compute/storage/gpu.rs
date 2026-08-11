@@ -1,14 +1,36 @@
 use crate::compute::uninit_vec;
+extern crate alloc;
 use cubecl_common::backtrace::BackTrace;
 use cubecl_core::server::IoError;
 use cubecl_runtime::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
 use cudarc::driver::DriverError;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy)]
 enum AllocationKind {
     Async,
     Sync,
+    /// Memory this storage did NOT allocate and must never free: a host region
+    /// the GPU reads in place.
+    ///
+    /// On a part with `pageableMemoryAccessUsesHostPageTables` the device walks
+    /// the host page tables, so an mmap'd file page IS addressable by a kernel
+    /// at its host address and there is nothing to allocate, copy, or map. What
+    /// there IS to get wrong is lifetime: the mapping must outlive every kernel
+    /// that reads it. The `Arc` is that guarantee made structural — it owns the
+    /// backing (the `Mmap`, boxed as `Any`) and is dropped only when this
+    /// storage entry is deallocated, which cannot happen while a handle derived
+    /// from it is alive.
+    External(alloc::sync::Arc<dyn core::any::Any + Send + Sync>),
+}
+
+impl core::fmt::Debug for AllocationKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AllocationKind::Async => write!(f, "Async"),
+            AllocationKind::Sync => write!(f, "Sync"),
+            AllocationKind::External(_) => write!(f, "External"),
+        }
+    }
 }
 
 /// Buffer storage for NVIDIA GPUs.
@@ -76,6 +98,11 @@ impl GpuStorage {
                             eprintln!("CUDA free error: {}", e);
                         }
                     }
+                    // Not ours. Freeing a host mapping through the CUDA
+                    // allocator would corrupt the heap; the only thing that
+                    // ends here is our claim on the backing, as the `Arc`
+                    // drops.
+                    AllocationKind::External(keepalive) => drop(keepalive),
                 }
             });
     }
@@ -135,6 +162,37 @@ impl PtrBindings {
         }
 
         ptr_ref
+    }
+}
+
+impl GpuStorage {
+    /// Register a host pointer the GPU can read in place, WITHOUT allocating or
+    /// copying, and return a [`StorageHandle`] addressing it.
+    ///
+    /// `ptr` is a **host** address. This is sound only where the device can
+    /// address host memory directly — `cudaDevAttrPageableMemoryAccess` — which
+    /// [`super::super::super::runtime`] checks before ever routing here. On such
+    /// parts `cudaHostGetDevicePointer` returns the host address unchanged, so
+    /// no translation is needed and none is done.
+    ///
+    /// `keepalive` owns whatever backs the region and is held until this entry
+    /// is deallocated. See [`AllocationKind::External`].
+    ///
+    /// # Safety
+    /// `ptr + offset .. ptr + offset + size` must be a live host region that
+    /// stays valid and unmoved for as long as `keepalive` is held, and must not
+    /// be mutated while a kernel may be reading it.
+    pub unsafe fn register_external(
+        &mut self,
+        ptr: cudarc::driver::sys::CUdeviceptr,
+        offset: u64,
+        size: u64,
+        keepalive: alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
+    ) -> StorageHandle {
+        let id = StorageId::new();
+        self.memory
+            .insert(id, (ptr, AllocationKind::External(keepalive)));
+        StorageHandle::new(id, StorageUtilization { offset, size })
     }
 }
 
