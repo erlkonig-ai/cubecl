@@ -78,3 +78,47 @@ mod tests {
     cubecl_std::testgen_tensor_identity!([f16, bf16, f32, u32]);
     cubecl_std::testgen_quantized_view!(f16);
 }
+
+/// Can this device read ordinary host memory (an `mmap`, a `Vec`) directly from
+/// a kernel, so a buffer can be *aliased* instead of copied?
+///
+/// This is `cudaDevAttrPageableMemoryAccess`. It is true on integrated and
+/// Grace-class parts, where the GPU walks the host page tables
+/// (`…UsesHostPageTables`) and `cudaHostGetDevicePointer` returns the host
+/// address unchanged; it is false on ordinary discrete cards, which must copy
+/// across PCIe.
+///
+/// Callers that want a fallback should ask BEFORE calling
+/// [`cubecl_runtime::client::ComputeClient::register_external_aliased`], which
+/// asserts this rather than degrading quietly.
+pub fn supports_zero_copy_host(device_index: usize) -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    // 0 = unknown, 1 = no, 2 = yes. Queried once; the answer is a property of
+    // the silicon and cannot change during a run.
+    static CACHE: [AtomicU8; 16] = [const { AtomicU8::new(0) }; 16];
+    let slot = CACHE.get(device_index);
+    if let Some(c) = slot {
+        match c.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    // SAFETY: querying a device attribute has no side effects and does not
+    // require a current context.
+    let ok = unsafe {
+        cudarc::driver::result::device::get(device_index as i32)
+            .and_then(|dev| {
+                cudarc::driver::result::device::get_attribute(
+                    dev,
+                    cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
+                )
+            })
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    };
+    if let Some(c) = slot {
+        c.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+    }
+    ok
+}

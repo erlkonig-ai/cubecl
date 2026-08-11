@@ -1,3 +1,4 @@
+extern crate alloc;
 use super::storage::gpu::{GpuResource, GpuStorage};
 use crate::{
     CudaCompiler,
@@ -123,6 +124,68 @@ impl ComputeServer for CudaServer {
 
         let reserved = command.reserve(size).unwrap();
         command.bind(reserved, memory);
+    }
+
+    /// Zero-copy: expose an mmap'd host region to kernels as a tensor handle.
+    ///
+    /// Unlike the wgpu/Metal implementation, which has to build a real buffer
+    /// object with `newBufferWithBytesNoCopy:` over a page-aligned superset,
+    /// this does nothing at all to the memory. GB10 reports
+    /// `pageableMemoryAccessUsesHostPageTables = 1`: the device walks the host
+    /// page tables, `cudaHostGetDevicePointer` hands back the identical address,
+    /// and a kernel dereferences an ordinary file-backed `mmap` correctly with
+    /// no registration. [`crate::supports_zero_copy_host`] is asserted here, so a
+    /// discrete part refuses loudly instead of silently reading garbage.
+    /// `page_len` is accepted for signature compatibility
+    /// and used only to bounds-check; there is no page-alignment requirement to
+    /// satisfy because there is no buffer being created.
+    ///
+    /// What still matters, and matters more than on Metal, is lifetime — a
+    /// kernel reading unmapped pages does not reliably fault, it reads whatever
+    /// the address now holds. `keepalive` owns the mapping and is dropped only
+    /// when the storage entry is deallocated.
+    fn register_external_aliased(
+        &mut self,
+        ptr: *mut core::ffi::c_void,
+        page_len: u64,
+        offset: u64,
+        size: u64,
+        keepalive: alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
+        stream_id: StreamId,
+    ) -> Handle {
+        assert!(
+            offset + size <= page_len,
+            "external region [{offset}, {}) does not fit in the {page_len} bytes described",
+            offset + size
+        );
+        assert!(
+            crate::supports_zero_copy_host(self.device_id.index_id as usize),
+            "this device cannot address host memory directly \
+             (cudaDevAttrPageableMemoryAccess = 0); handing it a host pointer would \
+             read garbage rather than fail, so the seam refuses instead. Use \
+             ComputeClient::create and pay the copy."
+        );
+        let mut command = match self.command_no_inputs(
+            stream_id,
+            StreamErrorMode {
+                ignore: true,
+                flush: false,
+            },
+        ) {
+            Ok(val) => val,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mm = &mut command.streams.current().memory_management_gpu;
+        // SAFETY: the `ComputeClient::register_external_aliased` contract makes
+        // the caller responsible for the region being live and immutable for
+        // the life of every handle derived from it; `keepalive` carries the
+        // owner so that outliving is enforced rather than merely promised.
+        let storage_handle = unsafe {
+            mm.storage()
+                .register_external(ptr as cudarc::driver::sys::CUdeviceptr, offset, size, keepalive)
+        };
+        let mem = mm.register_external(storage_handle);
+        Handle::from_memory(mem, stream_id, size)
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {
