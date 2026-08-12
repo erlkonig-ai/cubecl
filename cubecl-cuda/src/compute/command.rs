@@ -33,6 +33,27 @@ use cudarc::driver::sys::{
 };
 use std::{ffi::c_void, ops::DerefMut, sync::Arc};
 
+/// The host-to-device write sizes worth copying into pinned memory first.
+///
+/// Below the floor the extra host copy costs more than the pageable driver
+/// path, and the pinned pool would be churned by scalars and index vectors.
+/// Above the ceiling the pool would pin hundreds of megabytes permanently —
+/// an unembedding table is 3.3 GB — and pinned pages cannot be reclaimed,
+/// which on a box whose checkpoint already exceeds its RAM comes straight out
+/// of the page cache the weights are read through.
+const PINNED_STAGING_MIN: usize = 256 * 1024;
+const PINNED_STAGING_MAX: usize = 128 * 1024 * 1024;
+
+/// Whether to use it at all. Default OFF: on GB10 the pinned pool measured
+/// SLOWER than the pageable path it replaces (see `inkling_expert_probe`), and
+/// a switch keeps both lanes runnable from one binary instead of one build.
+fn pinned_staging_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("CUBECL_PIN_STAGING").as_deref(), Ok("1") | Ok("on"))
+    })
+}
+
 #[derive(new)]
 /// The `Command` struct encapsulates a CUDA context and a set of resolved CUDA streams, providing an
 /// interface for executing GPU-related operations such as memory allocation, data transfers, kernel
@@ -365,6 +386,28 @@ impl<'a> Command<'a> {
                 let mut buffer = self.reserve_pinned(size, None).unwrap();
                 data.copy_into(&mut buffer);
                 buffer
+            }
+            // Pageable host memory has no fast path: the driver stages the
+            // transfer through its own bounce buffer, in chunks, ON THIS
+            // THREAD. Measured on GB10 at 2.7 GB/s for a 14 MB write, against
+            // 29.5 GB/s for a plain host memcpy of the same bytes and 50 GB/s
+            // for the DMA engine itself. Copying into the pinned pool first
+            // and letting the engine read from there is one extra host copy
+            // and an ASYNCHRONOUS transfer — strictly cheaper above the size
+            // where the copy is not itself the cost.
+            AllocationProperty::Native | AllocationProperty::Other
+                if pinned_staging_enabled()
+                    && (PINNED_STAGING_MIN..=PINNED_STAGING_MAX).contains(&size) =>
+            {
+                match self.reserve_pinned(size, None) {
+                    Some(mut buffer) => {
+                        data.copy_into(&mut buffer);
+                        buffer
+                    }
+                    // The pinned pool is a pool, not a guarantee. A refusal
+                    // means fall back to the slow path, never fail the write.
+                    None => data,
+                }
             }
             _ => data,
         };
