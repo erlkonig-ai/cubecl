@@ -1,0 +1,8 @@
+# Build output.
+#
+# These crates are vendored sources, so a `cargo build` inside any of them
+# drops a target/ tree directly beside the code -- and two did, once:
+# cubecl-runtime and cubecl-wgpu, 2718 files / 899 MB uncompressed, committed
+# onto an orphan branch that is only ~139 files of actual source. cubecl-cuda
+# was vendored clean; this keeps it that way. Nothing here should be tracked.
+target/
