@@ -161,7 +161,7 @@ impl ComputeServer for CudaServer {
         assert!(
             crate::supports_zero_copy_host(self.device_id.index_id as usize),
             "this device cannot address host memory directly \
-             (cudaDevAttrPageableMemoryAccess = 0); handing it a host pointer would \
+             (pageable host access through host page tables is unavailable); handing it a host pointer would \
              read garbage rather than fail, so the seam refuses instead. Use \
              ComputeClient::create and pay the copy."
         );
@@ -181,8 +181,12 @@ impl ComputeServer for CudaServer {
         // the life of every handle derived from it; `keepalive` carries the
         // owner so that outliving is enforced rather than merely promised.
         let storage_handle = unsafe {
-            mm.storage()
-                .register_external(ptr as cudarc::driver::sys::CUdeviceptr, offset, size, keepalive)
+            mm.storage().register_external(
+                ptr as cudarc::driver::sys::CUdeviceptr,
+                offset,
+                size,
+                keepalive,
+            )
         };
         let mem = mm.register_external(storage_handle);
         Handle::from_memory(mem, stream_id, size)

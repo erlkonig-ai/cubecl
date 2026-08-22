@@ -82,10 +82,11 @@ mod tests {
 /// Can this device read ordinary host memory (an `mmap`, a `Vec`) directly from
 /// a kernel, so a buffer can be *aliased* instead of copied?
 ///
-/// This is `cudaDevAttrPageableMemoryAccess`. It is true on integrated and
-/// Grace-class parts, where the GPU walks the host page tables
-/// (`…UsesHostPageTables`) and `cudaHostGetDevicePointer` returns the host
-/// address unchanged; it is false on ordinary discrete cards, which must copy
+/// This requires both `cudaDevAttrPageableMemoryAccess` and
+/// `cudaDevAttrPageableMemoryAccessUsesHostPageTables`. The implementation
+/// hands the kernel the host address directly, so merely supporting pageable
+/// access through a driver-managed translation is not enough: the device must
+/// actually walk the host page tables. Ordinary discrete cards must copy
 /// across PCIe.
 ///
 /// Callers that want a fallback should ask BEFORE calling
@@ -109,12 +110,16 @@ pub fn supports_zero_copy_host(device_index: usize) -> bool {
     let ok = unsafe {
         cudarc::driver::result::device::get(device_index as i32)
             .and_then(|dev| {
-                cudarc::driver::result::device::get_attribute(
+                let pageable = cudarc::driver::result::device::get_attribute(
                     dev,
                     cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
-                )
+                )?;
+                let host_page_tables = cudarc::driver::result::device::get_attribute(
+                    dev,
+                    cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES,
+                )?;
+                Ok(pageable != 0 && host_page_tables != 0)
             })
-            .map(|v| v != 0)
             .unwrap_or(false)
     };
     if let Some(c) = slot {
