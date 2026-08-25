@@ -28,3 +28,13 @@ pub unsafe fn uninit_vec<I>(len: usize) -> Vec<I> {
 
     data
 }
+
+/// Set while a graph capture is open on any stream of this process.
+///
+/// It exists so the two storages can SAY whether a page they took was taken
+/// inside a capture. An allocation inside one is silently turned into a graph
+/// memory node, which instantiates fine and then fails at `cuGraphLaunch` with
+/// CUDA_ERROR_INVALID_VALUE -- a failure three calls away from its cause. The
+/// pinned storage has no stream to ask, so a flag is the only way it can know.
+pub static CAPTURE_OPEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);

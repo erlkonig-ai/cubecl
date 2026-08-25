@@ -180,6 +180,7 @@ impl ComputeServer for CudaServer {
         };
         self.unsafe_set_current();
         let stream = self.raw_stream(stream_id, Some(true));
+        crate::compute::CAPTURE_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
         unsafe { cudarc::driver::result::stream::begin_capture(stream, mode) }
             .expect("stream capture to begin");
     }
@@ -187,6 +188,7 @@ impl ComputeServer for CudaServer {
     fn graph_capture_end(&mut self, stream_id: StreamId) -> u64 {
         self.unsafe_set_current();
         let stream = self.raw_stream(stream_id, Some(false));
+        crate::compute::CAPTURE_OPEN.store(false, core::sync::atomic::Ordering::Relaxed);
         let graph = unsafe { cudarc::driver::result::stream::end_capture(stream) }
             .expect("stream capture to end");
         assert!(
@@ -201,7 +203,17 @@ impl ComputeServer for CudaServer {
         // the raw call is the honest way to say "no flags".
         let exec = unsafe {
             let mut exec = core::mem::MaybeUninit::uninit();
-            cudarc::driver::sys::cuGraphInstantiateWithFlags(exec.as_mut_ptr(), graph, 0)
+            // AUTO_FREE_ON_LAUNCH (1). A capture that could not avoid allocating
+            // holds MEMORY NODES, and a graph with unfreed memory nodes refuses
+            // to launch -- `cuGraphInstantiateWithFlags` accepts it and
+            // `cuGraphLaunch` then returns CUDA_ERROR_INVALID_VALUE, three calls
+            // away from the cause. This flag frees such nodes at each launch,
+            // which is what makes the graph relaunchable at all. It costs
+            // nothing on a graph that has none, and the pre-warm exists to make
+            // that the normal case: measured at 21 layers, exactly ONE
+            // allocation escaped into the capture, the KV tail page that grows
+            // by a row every step.
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(exec.as_mut_ptr(), graph, 1)
                 .result()
                 .expect("the captured graph to instantiate");
             exec.assume_init()

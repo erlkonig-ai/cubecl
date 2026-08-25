@@ -234,8 +234,16 @@ impl ComputeStorage for GpuStorage {
         // only says so at `end`. `CUBECL_GRAPH_TRACE_ALLOC=1` names every page
         // this takes and how it took it, which is how a capture failure gets
         // attributed to a call instead of to a hypothesis.
-        if std::env::var("CUBECL_GRAPH_TRACE_ALLOC").as_deref() == Ok("1") {
-            eprintln!("[graph-trace] GpuStorage::alloc {size} bytes");
+        let in_capture = crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed);
+        if in_capture || std::env::var("CUBECL_GRAPH_TRACE_ALLOC").as_deref() == Ok("1") {
+            eprintln!(
+                "[graph-trace] GpuStorage::alloc {size} bytes  IN-CAPTURE={in_capture}{}",
+                if in_capture {
+                    "  <-- becomes a graph MEMORY NODE; the graph will instantiate and then fail at cuGraphLaunch"
+                } else {
+                    ""
+                }
+            );
         }
         let ptr = unsafe { cudarc::driver::result::malloc_async(self.stream, size as usize) };
         let (ptr, kind) = match ptr {

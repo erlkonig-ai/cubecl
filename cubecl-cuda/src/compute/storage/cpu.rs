@@ -72,10 +72,11 @@ impl ComputeStorage for PinnedMemoryStorage {
         let offset = handle.offset() as usize;
         let size = handle.size() as usize;
 
-            if std::env::var("CUBECL_GRAPH_TRACE_ALLOC").as_deref() == Ok("1") {
+            let in_capture = crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed);
+            if in_capture || std::env::var("CUBECL_GRAPH_TRACE_ALLOC").as_deref() == Ok("1") {
                 eprintln!(
-                    "[graph-trace] PinnedMemoryStorage::alloc {size} bytes -- cuMemAllocHost is on \
-                     CUDA's potentially-unsafe list and invalidates an open capture"
+                    "[graph-trace] PinnedMemoryStorage::alloc {size} bytes  IN-CAPTURE={in_capture} \
+                     -- cuMemAllocHost is on CUDA's potentially-unsafe list"
                 );
             }
         // SAFETY: `memory.ptr` was allocated by `cuMemAllocHost_v2` with at least
