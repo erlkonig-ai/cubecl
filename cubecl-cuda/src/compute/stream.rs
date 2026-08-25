@@ -26,6 +26,12 @@ pub struct Stream {
     pub memory_management_cpu: MemoryManagement<PinnedMemoryStorage>,
     pub errors: Vec<ServerError>,
     pub drop_queue: drop_queue::PendingDropQueue<Fence>,
+    /// Set while a graph capture is open on `sys`. Nothing on the launch path
+    /// may block the host while this is true: inside a capture there is no
+    /// device progress to wait for, so a wait either deadlocks or -- what CUDA
+    /// actually does -- invalidates the capture, and `cuStreamEndCapture` then
+    /// hands back a null graph with no other complaint.
+    pub capturing: bool,
 }
 
 impl drop_queue::Fence for Fence {
@@ -75,6 +81,7 @@ impl EventStreamBackend for CudaStreamBackend {
 
         Stream {
             sys: stream,
+            capturing: false,
             memory_management_gpu,
             memory_management_cpu,
             errors: Vec::new(),

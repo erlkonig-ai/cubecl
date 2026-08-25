@@ -56,6 +56,18 @@ pub struct CudaServer {
     utilities: Arc<ServerUtilities<Self>>,
     comm_stream: *mut CUstream_st,
     communicators: HashMap<CommunicationId, *mut cudarc::nccl::sys::ncclComm>,
+    /// Captured graphs, by the id handed back to the caller. They are created,
+    /// launched and destroyed only here, on the one thread that owns the
+    /// server, because a CUgraph is not internally synchronized.
+    graphs: HashMap<u64, CapturedGraph>,
+    next_graph_id: u64,
+}
+
+/// One captured region: the graph and the executable instantiated from it.
+#[derive(Debug)]
+struct CapturedGraph {
+    graph: cudarc::driver::sys::CUgraph,
+    exec: cudarc::driver::sys::CUgraphExec,
 }
 
 // SAFETY: `CudaServer` is only accessed from one thread at a time via the `DeviceHandle`,
@@ -144,6 +156,113 @@ impl ComputeServer for CudaServer {
     /// kernel reading unmapped pages does not reliably fault, it reads whatever
     /// the address now holds. `keepalive` owns the mapping and is dropped only
     /// when the storage entry is deallocated.
+    fn graph_capture_supported(&self) -> bool {
+        true
+    }
+
+    /// `INK_GRAPH_CAPTURE_MODE` selects the capture mode. `thread-local` (the
+    /// default) makes the driver REJECT a host-blocking call made from this
+    /// thread while capture is open, which is what turns a silent
+    /// wrong-capture into a loud error. `relaxed` only polices the capturing
+    /// stream itself and is here to answer "what exactly is it rejecting?"
+    /// during bring-up -- it is not a fix, because the calls it stops
+    /// rejecting are the ones that would bake a stale pointer into the graph.
+    fn graph_defer_frees(&mut self, defer: bool, stream_id: StreamId) {
+        self.raw_stream(stream_id, Some(defer));
+    }
+
+    fn graph_capture_begin(&mut self, stream_id: StreamId) {
+        use cudarc::driver::sys::CUstreamCaptureMode;
+        let mode = match std::env::var("INK_GRAPH_CAPTURE_MODE").as_deref() {
+            Ok("relaxed") => CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            Ok("global") => CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            _ => CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        };
+        self.unsafe_set_current();
+        let stream = self.raw_stream(stream_id, Some(true));
+        unsafe { cudarc::driver::result::stream::begin_capture(stream, mode) }
+            .expect("stream capture to begin");
+    }
+
+    fn graph_capture_end(&mut self, stream_id: StreamId) -> u64 {
+        self.unsafe_set_current();
+        let stream = self.raw_stream(stream_id, Some(false));
+        let graph = unsafe { cudarc::driver::result::stream::end_capture(stream) }
+            .expect("stream capture to end");
+        assert!(
+            !graph.is_null(),
+            "the capture closed with no graph -- it was invalidated while open"
+        );
+        // Flags 0. `CUDA_GRAPH_INSTANTIATE_FLAG_UPLOAD` is NOT valid here: it
+        // is only honoured by `cuGraphInstantiateWithParams`, which takes the
+        // stream to upload on, and passing it to the flags-only entry point is
+        // rejected with CUDA_ERROR_INVALID_VALUE. cudarc's `graph::instantiate`
+        // types its argument as the flags enum, which has no zero variant, so
+        // the raw call is the honest way to say "no flags".
+        let exec = unsafe {
+            let mut exec = core::mem::MaybeUninit::uninit();
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(exec.as_mut_ptr(), graph, 0)
+                .result()
+                .expect("the captured graph to instantiate");
+            exec.assume_init()
+        };
+        // Upload separately, which is what the flag would have done, so the
+        // first replay is not paying for the graph's own setup.
+        unsafe { cudarc::driver::result::graph::upload(exec, stream) }
+            .expect("the graph to upload");
+        let id = self.next_graph_id;
+        self.next_graph_id += 1;
+        self.graphs.insert(id, CapturedGraph { graph, exec });
+        id
+    }
+
+    fn graph_replay(&mut self, id: u64, stream_id: StreamId) {
+        self.unsafe_set_current();
+        let stream = self.raw_stream(stream_id, None);
+        let exec = self
+            .graphs
+            .get(&id)
+            .unwrap_or_else(|| panic!("no captured graph with id {id}"))
+            .exec;
+        unsafe { cudarc::driver::result::graph::launch(exec, stream) }.expect("the graph to launch");
+    }
+
+    fn graph_capture_status(&mut self, stream_id: StreamId) -> u32 {
+        self.unsafe_set_current();
+        let stream = self.raw_stream(stream_id, None);
+        match unsafe { cudarc::driver::result::stream::is_capturing(stream) } {
+            Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE) => 0,
+            Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE) => 1,
+            Ok(_) => 2,
+            Err(_) => 3,
+        }
+    }
+
+    fn graph_node_count(&mut self, id: u64) -> usize {
+        let graph = self
+            .graphs
+            .get(&id)
+            .unwrap_or_else(|| panic!("no captured graph with id {id}"))
+            .graph;
+        let mut n: usize = 0;
+        unsafe {
+            cudarc::driver::sys::cuGraphGetNodes(graph, core::ptr::null_mut(), &mut n)
+                .result()
+                .expect("the graph to report its node count");
+        }
+        n
+    }
+
+    fn graph_destroy(&mut self, id: u64) {
+        if let Some(g) = self.graphs.remove(&id) {
+            self.unsafe_set_current();
+            unsafe {
+                let _ = cudarc::driver::result::graph::exec_destroy(g.exec);
+                let _ = cudarc::driver::result::graph::destroy(g.graph);
+            }
+        }
+    }
+
     fn register_external_aliased(
         &mut self,
         ptr: *mut core::ffi::c_void,
@@ -632,7 +751,40 @@ impl CudaServer {
             utilities: Arc::new(utilities),
             comm_stream,
             communicators: HashMap::default(),
+            graphs: HashMap::default(),
+            next_graph_id: 1,
         }
+    }
+
+    /// The raw CUDA stream this `stream_id` resolves to. Capture is a property
+    /// of one stream, so begin/end/replay must all name the same one.
+    ///
+    /// `set_capturing` also marks the stream, which is what stops the launch
+    /// path's drop-queue flush from host-blocking inside the region. Measured:
+    /// without the mark, a capture dies at exactly launch 63 of a chain,
+    /// because the queue's policy fires at 64 staged `Bytes` and its flush
+    /// waits on a fence.
+    fn raw_stream(
+        &mut self,
+        stream_id: StreamId,
+        set_capturing: Option<bool>,
+    ) -> cudarc::driver::sys::CUstream {
+        let mut command = self
+            .command_no_inputs(
+                stream_id,
+                StreamErrorMode {
+                    ignore: true,
+                    flush: false,
+                },
+            )
+            .expect("a stream to capture on");
+        let current = command.streams.current();
+        if let Some(v) = set_capturing {
+            current.capturing = v;
+        }
+        let stream = current.sys;
+        core::mem::drop(command);
+        stream
     }
 
     fn command_no_inputs(

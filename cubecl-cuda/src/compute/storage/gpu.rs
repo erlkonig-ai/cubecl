@@ -229,10 +229,22 @@ impl ComputeStorage for GpuStorage {
         // SAFETY: Calling CUDA driver FFI to allocate device memory. First tries async
         // allocation on the stream; falls back to synchronous allocation if that fails.
         // The returned pointer is stored in `self.memory` and freed on deallocation.
+        // A device allocation inside a graph capture is the thing most likely to
+        // break one, and it breaks it SILENTLY -- the capture is invalidated and
+        // only says so at `end`. `CUBECL_GRAPH_TRACE_ALLOC=1` names every page
+        // this takes and how it took it, which is how a capture failure gets
+        // attributed to a call instead of to a hypothesis.
+        if std::env::var("CUBECL_GRAPH_TRACE_ALLOC").as_deref() == Ok("1") {
+            eprintln!("[graph-trace] GpuStorage::alloc {size} bytes");
+        }
         let ptr = unsafe { cudarc::driver::result::malloc_async(self.stream, size as usize) };
         let (ptr, kind) = match ptr {
             Ok(ptr) => (ptr, AllocationKind::Async),
             Err(_) => unsafe {
+                eprintln!(
+                    "[graph-trace] malloc_async FAILED for {size} bytes -- falling back to the \
+                     SYNCHRONOUS cuMemAlloc, which invalidates any open capture"
+                );
                 match cudarc::driver::result::malloc_sync(size as usize) {
                     Ok(ptr) => (ptr, AllocationKind::Sync),
                     Err(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY)) => {

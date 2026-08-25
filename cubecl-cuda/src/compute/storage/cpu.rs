@@ -72,6 +72,12 @@ impl ComputeStorage for PinnedMemoryStorage {
         let offset = handle.offset() as usize;
         let size = handle.size() as usize;
 
+            if std::env::var("CUBECL_GRAPH_TRACE_ALLOC").as_deref() == Ok("1") {
+                eprintln!(
+                    "[graph-trace] PinnedMemoryStorage::alloc {size} bytes -- cuMemAllocHost is on \
+                     CUDA's potentially-unsafe list and invalidates an open capture"
+                );
+            }
         // SAFETY: `memory.ptr` was allocated by `cuMemAllocHost_v2` with at least
         // `offset + size` bytes. The `add(offset)` produces a pointer within the allocation
         // bounds as guaranteed by the storage handle's offset/size validation.

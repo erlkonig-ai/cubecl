@@ -329,6 +329,74 @@ where
     /// Initializes [memory](ManagedMemoryHandle) on the given [stream](StreamId) with the given size.
     fn initialize_memory(&mut self, memory: ManagedMemoryHandle, size: u64, stream_id: StreamId);
 
+    /// Whether this backend can capture a region of enqueued work into a
+    /// replayable object at all. Callers must check this before capturing:
+    /// the capture methods below panic on a backend that cannot.
+    fn graph_capture_supported(&self) -> bool {
+        false
+    }
+
+    /// Defer the stream's pending-drop flush without opening a capture.
+    ///
+    /// This is the PRE-WARM for a capture, and it is needed because a capture
+    /// changes what the allocator has to hold at once. Normally a staging
+    /// buffer is handed back a few launches after it is used, so a region of
+    /// N launches only ever needs a handful of pages live. Inside a capture
+    /// nothing is handed back -- the flush waits on a fence, which a capture
+    /// cannot contain, and the buffers must stay alive anyway because the
+    /// graph re-reads them on every replay. So the region's requirement jumps
+    /// from its per-launch working set to its SIMULTANEOUS HIGH-WATER MARK,
+    /// and the pool discovers that by allocating, which is the one thing that
+    /// breaks a capture.
+    ///
+    /// Running the region once with frees deferred and no capture open lets
+    /// the pool reach that high-water mark the legal way. Flushing afterwards
+    /// returns the slices but keeps the pages, so the capture that follows
+    /// finds every page it needs already there.
+    fn graph_defer_frees(&mut self, _defer: bool, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Begin capturing work enqueued on `stream_id` instead of running it.
+    /// Between this and [`ComputeServer::graph_capture_end`] nothing executes;
+    /// the enqueued work is recorded as a graph. Anything that BLOCKS THE HOST
+    /// on device progress inside the captured region (a sync, a fence wait, a
+    /// blocking read) invalidates the capture, because there is no device
+    /// progress to wait for.
+    fn graph_capture_begin(&mut self, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Close the capture opened by [`ComputeServer::graph_capture_begin`],
+    /// instantiate the result, and return an id naming it for replay. The
+    /// captured graph holds the EXACT device pointers seen during capture, so
+    /// every buffer it touches must live at a stable address across replays.
+    fn graph_capture_end(&mut self, _stream_id: StreamId) -> u64 {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Enqueue one replay of the graph named by `id` on `stream_id`.
+    fn graph_replay(&mut self, _id: u64, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// 0 = not capturing, 1 = capturing, 2 = INVALIDATED, 3 = query failed.
+    /// A capture that has been invalidated keeps accepting work silently and
+    /// only reports it at `end`, so this is the only way to find WHICH call
+    /// broke one.
+    fn graph_capture_status(&mut self, _stream_id: StreamId) -> u32 {
+        3
+    }
+
+    /// How many nodes the captured graph holds. This is the unit the replay
+    /// cost is quoted per, so it belongs next to the graph, not in a log line.
+    fn graph_node_count(&mut self, _id: u64) -> usize {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Release a captured graph. An unknown id is ignored.
+    fn graph_destroy(&mut self, _id: u64) {}
+
     /// Register an externally-owned GPU buffer that ALIASES host memory (e.g.
     /// mmap'd pile pages) as a tensor [`Handle`], with ZERO copy. `ptr`/`page_len`
     /// describe a page-aligned superset region (required by Metal's

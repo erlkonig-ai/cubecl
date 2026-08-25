@@ -478,6 +478,72 @@ impl<R: Runtime> ComputeClient<R> {
         self.do_empty(vec![descriptor]).unwrap().remove(0).memory
     }
 
+    /// See [`ComputeServer::graph_capture_supported`].
+    pub fn graph_capture_supported(&self) -> bool {
+        self.device
+            .submit_blocking(move |server| server.graph_capture_supported())
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_defer_frees`].
+    pub fn graph_defer_frees(&self, defer: bool) {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_defer_frees(defer, stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_capture_begin`].
+    pub fn graph_capture_begin(&self) {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_capture_begin(stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_capture_end`].
+    pub fn graph_capture_end(&self) -> u64 {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_capture_end(stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_replay`].
+    ///
+    /// Fire-and-forget, exactly like a kernel launch: a replay is enqueued
+    /// work, and making the caller wait for the device thread to pick it up
+    /// would hand back most of what the graph was supposed to save. The whole
+    /// point of the call is that ONE of these replaces the hundreds of
+    /// dispatches the captured region used to cost.
+    pub fn graph_replay(&self, id: u64) {
+        let stream_id = self.stream_id();
+        self.device
+            .submit(move |server| server.graph_replay(id, stream_id));
+    }
+
+    /// See [`ComputeServer::graph_capture_status`].
+    pub fn graph_capture_status(&self) -> u32 {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_capture_status(stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_node_count`].
+    pub fn graph_node_count(&self, id: u64) -> usize {
+        self.device
+            .submit_blocking(move |server| server.graph_node_count(id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_destroy`].
+    pub fn graph_destroy(&self, id: u64) {
+        self.device
+            .submit_blocking(move |server| server.graph_destroy(id))
+            .unwrap()
+    }
+
     /// Register an externally-owned GPU buffer that ALIASES host memory (e.g.
     /// mmap'd pile pages) as a ZERO-COPY tensor [`Handle`]. `ptr`/`page_len`
     /// describe a page-aligned superset region; `offset`/`size` locate the tensor

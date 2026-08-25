@@ -521,7 +521,12 @@ impl<'a> Command<'a> {
             const_info,
         );
 
-        if stream.drop_queue.should_flush() {
+        // `flush` waits on a fence -- `cuEventSynchronize` -- which is exactly
+        // the host block a capture cannot contain. Deferring it is safe: the
+        // queue only grows, and the first launch after the capture closes
+        // drains it. Callers are expected to pre-flush before capturing so the
+        // deferral spans one region, not the whole run.
+        if !stream.capturing && stream.drop_queue.should_flush() {
             stream.drop_queue.flush(|| Fence::new(stream.sys));
         }
 
