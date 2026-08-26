@@ -526,6 +526,22 @@ impl<R: Runtime> ComputeClient<R> {
             .unwrap()
     }
 
+    /// See [`ComputeServer::reserve_timing`].
+    pub fn reserve_timing(&self) -> (u64, u64) {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.reserve_timing(stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::reserve_timing_reset`].
+    pub fn reserve_timing_reset(&self) {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.reserve_timing_reset(stream_id))
+            .unwrap()
+    }
+
     /// See [`ComputeServer::graph_capture_begin`].
     pub fn graph_capture_begin(&self) {
         let stream_id = self.stream_id();

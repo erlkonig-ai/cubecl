@@ -101,6 +101,32 @@ struct CapturedLaunch {
     ptrs: Vec<u64>,
     info: Vec<u64>,
     info_is_grid_constant: bool,
+    /// Where the DYNAMIC half of `info` starts.
+    ///
+    /// The packed blob is two things end to end and only the first reaches the
+    /// kernel by value. `info[..dyn_offset]` is the scalars plus the static
+    /// metadata -- buffer lengths, ranks, and the offsets into the dynamic half
+    /// -- and it rides as a grid constant, so a parameter rewrite moves it.
+    /// `info[dyn_offset..]` is every bound tensor's SHAPE and STRIDE list,
+    /// which is variable-length and therefore cannot be a fixed-size kernel
+    /// parameter: it is uploaded to a device buffer instead, by a memcpy node
+    /// that no `cuGraphExecKernelNodeSetParams` reaches. Splitting a moved word
+    /// on this offset is what says whether it is patchable or staged, and
+    /// before it existed the two were reported as one number.
+    dyn_offset: usize,
+    /// Which of the graph's pinned staging buffers this launch's dynamic
+    /// metadata was uploaded from, if it had any.
+    ///
+    /// This is the patch channel for the half a parameter rewrite cannot reach.
+    /// The buffer belongs to the graph and its address is what the memcpy node
+    /// recorded, so writing new bytes into it -- a host memcpy, no driver call
+    /// at all -- makes the next replay upload the CURRENT step's shapes and
+    /// strides through the node captured for the old ones.
+    staging: Option<usize>,
+    /// The kernel, named. Diagnostics only, and only populated during a
+    /// capture: a region with a hundred moving launches is an inventory, and an
+    /// inventory of indices is not one anybody can act on.
+    name: alloc::string::String,
 }
 
 /// Whether a capture holds the buffers its nodes point at. On, always, in any
@@ -304,6 +330,22 @@ impl ComputeServer for CudaServer {
             .arena_reset_counters();
     }
 
+    fn reserve_timing(&mut self, stream_id: StreamId) -> (u64, u64) {
+        self.arena_command(stream_id)
+            .streams
+            .current()
+            .memory_management_gpu
+            .reserve_timing()
+    }
+
+    fn reserve_timing_reset(&mut self, stream_id: StreamId) {
+        self.arena_command(stream_id)
+            .streams
+            .current()
+            .memory_management_gpu
+            .reserve_timing_reset();
+    }
+
     fn graph_capture_begin(&mut self, stream_id: StreamId) {
         use cudarc::driver::sys::CUstreamCaptureMode;
         let mode = match std::env::var("INK_GRAPH_CAPTURE_MODE").as_deref() {
@@ -483,6 +525,9 @@ impl ComputeServer for CudaServer {
             info: l.info.clone(),
             info_is_grid_constant: l.info_is_grid_constant,
             ptrs: l.ptrs.clone(),
+            dyn_offset: l.dyn_offset,
+            has_staging: l.staging.is_some(),
+            name: l.name.clone(),
         }
     }
 
@@ -499,6 +544,54 @@ impl ComputeServer for CudaServer {
             .unwrap_or_else(|| panic!("no captured graph with id {id}"));
         let exec = g.exec;
         let n = g.launches.len();
+        // THE STAGED HALF, rewritten before the by-value half, and not through
+        // the driver at all.
+        //
+        // `info[dyn_offset..]` is the shapes and strides, and it reaches the
+        // kernel through a memcpy node that `cuGraphExecKernelNodeSetParams`
+        // cannot touch. What it CAN be reached through is the node's recorded
+        // SOURCE: a pinned buffer this graph owns, at an address fixed for the
+        // graph's life. Writing the new bytes there is a host memcpy -- no
+        // driver call, no node edit -- and the next replay uploads them through
+        // the node captured for the old ones. That is the whole fix for the
+        // half a parameter rewrite was said not to reach.
+        //
+        // Done first because it borrows `g.staging` while the by-value rewrite
+        // borrows `g.launches`, and because a patch that fails half way should
+        // fail before it has edited the exec.
+        if let Some(info) = patch.info.as_ref() {
+            let l = g.launches.get(idx).unwrap_or_else(|| {
+                panic!("graph {id} recorded {n} launches, so there is no launch {idx}")
+            });
+            let (off, slot) = (l.dyn_offset, l.staging);
+            if off < info.len() && info[off..] != l.info[off..] {
+                let src = &info[off..];
+                let slot = slot.unwrap_or_else(|| {
+                    panic!(
+                        "launch {idx} of graph {id} has moving DYNAMIC metadata -- a bound \
+                         tensor's shape or stride changed -- and no staging buffer to write it \
+                         into. Its memcpy node would keep uploading the captured step's shapes, \
+                         and the replay would compute a plausible wrong answer rather than fail. \
+                         The launch was captured with CUBECL_GRAPH_STAGE_OWN=0, which is the arm \
+                         that hands staging back to the pool."
+                    )
+                });
+                let dst = g.staging.get_mut(slot).unwrap_or_else(|| {
+                    panic!("graph {id} owns no staging buffer {slot} for launch {idx}")
+                });
+                let bytes: &[u8] = bytemuck::cast_slice(src);
+                assert_eq!(
+                    bytes.len(),
+                    dst.len(),
+                    "launch {idx} of graph {id} staged {} bytes of dynamic metadata and the \
+                     patch offers {} -- a memcpy node's SIZE is recorded, so a different length \
+                     is a different region, not a different value",
+                    dst.len(),
+                    bytes.len()
+                );
+                dst.copy_from_slice(bytes);
+            }
+        }
         let l = g
             .launches
             .get_mut(idx)
@@ -1375,6 +1468,18 @@ impl CudaServer {
             }
         };
 
+        let capture_open = crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed);
+        // WHICH pinned buffer this launch's dynamic metadata was staged
+        // through, counted rather than inferred. `write_to_gpu` pushes it onto
+        // `capture_staging` while a capture is open -- but only when the
+        // capture owns its staging, and `CUBECL_GRAPH_STAGE_OWN=0` is an arm
+        // where it does not. So the index is the difference between two
+        // lengths, which is right under either arm, instead of "the last one",
+        // which would name somebody else's buffer under one of them.
+        let staged_before = match capture_open {
+            true => command.streams.current().capture_staging.len(),
+            false => 0,
+        };
         let (info_const, info_binding) = if grid_constants {
             let info = &bindings.info;
 
@@ -1392,19 +1497,30 @@ impl CudaServer {
             }
             (None, handle)
         };
+        let staging_idx = match capture_open {
+            true => {
+                let now = command.streams.current().capture_staging.len();
+                (now > staged_before).then(|| now - 1)
+            }
+            false => None,
+        };
 
         // While a capture is open every buffer this launch binds becomes a
         // POINTER inside a graph node and stays one for the graph's whole life,
         // so none of them may go back to the allocator. Collected into a local
         // because `command` holds the server borrow until it is dropped.
         let mut hold_now: Vec<Binding> = Vec::new();
-        let capture_open = crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed);
         // The packed scalar+metadata blob, copied while it is still the
         // caller's. A node holds the BYTES, so a later rewrite has to be able
         // to reproduce them, and by then this vector is gone.
         let info_snapshot = match capture_open {
             true => Some(bindings.info.data.clone()),
             false => None,
+        };
+        let dyn_offset = bindings.info.dynamic_metadata_offset;
+        let capture_name = match capture_open {
+            true => alloc::format!("{:?}", kernel_id),
+            false => alloc::string::String::new(),
         };
         let capturing = capture_open && capture_hold_enabled();
         if capturing {
@@ -1647,6 +1763,9 @@ impl CudaServer {
                 ptrs: resources.iter().map(|r| r.ptr).collect(),
                 info: info_snapshot.unwrap_or_default(),
                 info_is_grid_constant: grid_constants,
+                dyn_offset,
+                staging: staging_idx,
+                name: capture_name,
             });
         }
 

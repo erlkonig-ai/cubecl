@@ -392,6 +392,21 @@ where
     /// counted apart from the warm pass.
     fn graph_arena_reset_counters(&mut self, _stream_id: StreamId) {}
 
+    /// What the allocator's RESERVE half costs, as `(calls, nanoseconds)`.
+    ///
+    /// A decode step makes roughly one reservation per kernel launch, and all
+    /// of it is host work inside the term a graph replay removes. The count has
+    /// been reported for a while; this is the time, because a count is not a
+    /// time and the two lead to opposite conclusions at 0.5 us and at 5 us a
+    /// request. Zero unless `CUBECL_TIME_RESERVE=1`. It does NOT include the
+    /// free half, which happens on handle drop.
+    fn reserve_timing(&mut self, _stream_id: StreamId) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// Zero the reservation timer.
+    fn reserve_timing_reset(&mut self, _stream_id: StreamId) {}
+
     /// Begin capturing work enqueued on `stream_id` instead of running it.
     /// Between this and [`ComputeServer::graph_capture_end`] nothing executes;
     /// the enqueued work is recorded as a graph. Anything that BLOCKS THE HOST
@@ -1369,6 +1384,21 @@ pub struct GraphLaunchParams {
     pub info_is_grid_constant: bool,
     /// The device address of every buffer the launch bound, in binding order.
     pub ptrs: Vec<u64>,
+    /// Where the DYNAMIC half of `info` starts.
+    ///
+    /// `info[..dyn_offset]` is the scalars and the static metadata and reaches
+    /// the kernel BY VALUE, so a parameter rewrite moves it.
+    /// `info[dyn_offset..]` is every bound tensor's shape and stride list; it
+    /// is variable-length, so it cannot be a fixed-size kernel parameter and
+    /// is uploaded by a memcpy node instead. A word that moved between two
+    /// captures is patchable or staged according to which side of this it
+    /// falls on, and reporting the two as one number says neither.
+    pub dyn_offset: usize,
+    /// Whether the launch has a pinned staging buffer the graph owns, i.e.
+    /// whether its dynamic half can be rewritten at all.
+    pub has_staging: bool,
+    /// The kernel, named. Populated only for launches recorded by a capture.
+    pub name: String,
 }
 
 /// What to change about one captured launch. Fields left `None`/empty keep the

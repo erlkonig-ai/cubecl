@@ -134,6 +134,13 @@ pub struct ArenaStats {
     pub bytes_in_use: u64,
 }
 
+/// Whether [`MemoryManagement::reserve`] times itself. Read once: a `getenv`
+/// per reservation would be a cost on the path this exists to measure.
+fn time_reserve() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_TIME_RESERVE").as_deref() == Ok("1"))
+}
+
 /// Reserves and keeps track of chunks of memory in the storage, and slices upon these chunks.
 pub struct MemoryManagement<Storage> {
     name: String,
@@ -167,6 +174,21 @@ pub struct MemoryManagement<Storage> {
     pools: Vec<DynamicPool>,
     storage: Storage,
     alloc_reserve_count: u64,
+    /// Wall time spent inside [`MemoryManagement::reserve`], in nanoseconds,
+    /// and how many calls it covers.
+    ///
+    /// Off unless `CUBECL_TIME_RESERVE=1`, because it costs two clock reads a
+    /// reservation and a decode step makes about one per kernel launch. It
+    /// exists because "1869 allocation requests a step" is a COUNT, and a
+    /// count is not a time: at 0.5 us a request that is 0.9 ms of a 37 ms
+    /// enqueue and marginal, at 5 us it is 9.3 ms and it is the largest item
+    /// after the launches themselves. Nobody had any business asserting which
+    /// until it was timed.
+    ///
+    /// FRAMING: this is the RESERVE half only. Returning a slice to the pool
+    /// happens on handle drop, elsewhere, and is not in this number.
+    reserve_nanos: u64,
+    reserve_calls: u64,
     mode: MemoryAllocationMode,
     config: PersistentMemory,
     logger: Arc<ServerLogger>,
@@ -411,6 +433,8 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
             pools,
             storage,
             alloc_reserve_count: 0,
+            reserve_nanos: 0,
+            reserve_calls: 0,
             mode,
             config,
             logger,
@@ -702,6 +726,30 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     /// Finds a spot in memory for a resource with the given size in bytes, and returns a handle to it
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     pub fn reserve(&mut self, size: u64) -> Result<ManagedMemoryHandle, IoError> {
+        if time_reserve() {
+            let t = web_time::Instant::now();
+            let out = self.reserve_inner(size);
+            self.reserve_nanos += t.elapsed().as_nanos() as u64;
+            self.reserve_calls += 1;
+            return out;
+        }
+        self.reserve_inner(size)
+    }
+
+    /// What a reservation costs, as `(calls, nanoseconds)` since the last
+    /// reset. Zero unless `CUBECL_TIME_RESERVE=1`.
+    pub fn reserve_timing(&self) -> (u64, u64) {
+        (self.reserve_calls, self.reserve_nanos)
+    }
+
+    /// Zero the reservation timer, so one pass can be counted apart from the
+    /// startup that preceded it.
+    pub fn reserve_timing_reset(&mut self) {
+        self.reserve_calls = 0;
+        self.reserve_nanos = 0;
+    }
+
+    fn reserve_inner(&mut self, size: u64) -> Result<ManagedMemoryHandle, IoError> {
         // If this happens every nanosecond, counts overflows after 585 years, so not worth thinking too
         // hard about overflow here.
         self.alloc_reserve_count += 1;
