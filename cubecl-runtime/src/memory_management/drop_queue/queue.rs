@@ -96,6 +96,22 @@ impl<F: Fence> PendingDropQueue<F> {
 
     /// Rotate the double-buffer and free any memory the device is done with.
     ///
+    /// THE POOL IS ALREADY REUSING THESE BUFFERS; THE BLOCKING IS THE PROOF,
+    /// NOT THE REUSE. `reserve_pinned` hands out POOLED slices, so nothing here
+    /// is allocating fresh host memory per upload -- the only thing this
+    /// function adds is the evidence that the device has finished reading a
+    /// slice before the pool may hand the same one out again. That is why the
+    /// stall it causes is queue-depth serialisation rather than a data
+    /// dependency, and why raising the threshold is not merely "flush less
+    /// often": past the depth where the fence being waited on was recorded long
+    /// enough ago that the device has already passed it, the wait goes to
+    /// approximately zero rather than to a fraction of itself.
+    ///
+    /// The cure that removes the reason for the flush rather than the frequency
+    /// of it is to stop staging per launch at all -- see
+    /// `docs/METADATA_CACHE.md` in mary, which is where the 483 uploads a
+    /// decode step come from.
+    ///
     /// `factory` is called to produce a [`Fence`]. It should submit (or
     /// record) a device signal command so that syncing the fence guarantees all
     /// preceding device work is complete.
