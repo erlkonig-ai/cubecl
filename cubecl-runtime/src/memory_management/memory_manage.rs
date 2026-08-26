@@ -113,10 +113,57 @@ pub enum MemoryAllocationMode {
     Persistent,
 }
 
+/// What the capture arena is holding, and how it got there.
+///
+/// `misses` is the load-bearing one: a miss taken while a stream capture is
+/// open is a driver allocation recorded as a graph MEMORY node, which is both a
+/// per-replay cost and an address the next capture will not reproduce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArenaStats {
+    /// How many times the arena has been opened.
+    pub generation: u64,
+    /// Reservations served from the arena since the last counter reset.
+    pub served: u64,
+    /// Of those, the ones that needed a fresh allocation from the storage.
+    pub misses: u64,
+    /// Slices the arena owns.
+    pub slices: u64,
+    /// Bytes the arena keeps reserved, whether in use or free.
+    pub bytes_reserved: u64,
+    /// Bytes of that currently held by a live handle.
+    pub bytes_in_use: u64,
+}
+
 /// Reserves and keeps track of chunks of memory in the storage, and slices upon these chunks.
 pub struct MemoryManagement<Storage> {
     name: String,
     persistent: PersistentPool,
+    /// The capture-scoped arena. See [`MemoryManagement::arena_begin`].
+    arena: PersistentPool,
+    /// The `pool` byte an arena slice's location carries, so `find` and `bind`
+    /// can route back here. One past the persistent pool's.
+    arena_pool_pos: u8,
+    /// While true, EVERY `reserve` is served from `arena` and none from the
+    /// ordinary pools.
+    arena_active: bool,
+    /// Bumped on every [`MemoryManagement::arena_begin`]. Reporting only: what
+    /// decides whether two graphs may share this arena is `arena_sizes`, not
+    /// how many times it was opened.
+    arena_generation: u64,
+    /// Requests the arena served, and the subset it could not satisfy from an
+    /// already-owned slice. A miss inside a capture is exactly a graph memory
+    /// node, so this is the number the warm pass exists to drive to zero.
+    arena_served: u64,
+    arena_misses: u64,
+    /// Every size the arena has served since it was last opened, in order.
+    ///
+    /// This is the region's IDENTITY as far as the arena is concerned. Two
+    /// captures that share an arena share its slices -- that is the point, it
+    /// is what makes their addresses comparable -- and sharing scratch is safe
+    /// exactly when both are captures of the same region, replayed serially.
+    /// The same region issues the same request sequence; a different one does
+    /// not, and a hash over the window is what lets a replay say so.
+    arena_sizes: Vec<u64>,
     pools: Vec<DynamicPool>,
     storage: Storage,
     alloc_reserve_count: u64,
@@ -352,6 +399,15 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
                 properties.alignment,
                 pools.len() as u8,
             ),
+            // The arena accepts any size the storage will accept: a captured
+            // region does not get to choose which of its buffers are small.
+            arena: PersistentPool::new(u64::MAX, properties.alignment, pools.len() as u8 + 1),
+            arena_pool_pos: pools.len() as u8 + 1,
+            arena_active: false,
+            arena_generation: 0,
+            arena_served: 0,
+            arena_misses: 0,
+            arena_sizes: Vec::new(),
             pools,
             storage,
             alloc_reserve_count: 0,
@@ -380,6 +436,148 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
             },
         );
         self.mode = mode;
+    }
+
+    /// Route every subsequent `reserve` into the capture arena, and return the
+    /// generation this opening is.
+    ///
+    /// The arena exists because a captured graph records ADDRESSES. Three
+    /// things have to be true at once, and no ordinary pool gives all three:
+    ///
+    /// 1. **Reuse inside the region.** A buffer born inside the captured region
+    ///    and dead inside it must hand its slice back, so the region's peak
+    ///    footprint is its live set and not its allocation count. Without this
+    ///    every intra-region allocation becomes a driver allocation made while
+    ///    the stream is capturing, i.e. a graph MEMORY node.
+    /// 2. **Whole-arena reservation.** Once the region is captured, every slice
+    ///    the arena ever handed out is baked into a node, so NOTHING outside a
+    ///    capture may be given one for as long as the graph can be replayed.
+    ///    The arena is only ever consulted while it is open, and it never
+    ///    returns pages to the storage, so this holds for the whole arena and
+    ///    not just for the slices that happened to be live at capture end.
+    /// 3. **A deterministic base.** Reopening the arena resets no slice and
+    ///    frees nothing; slices are matched by exact effective size in a fixed
+    ///    order. A periodic region therefore issues an identical request
+    ///    sequence against an identical free set and gets identical addresses,
+    ///    which is what makes two captures of the same region comparable and a
+    ///    single graph legitimate for every step.
+    ///
+    /// Note what this is NOT: it is not "hold the buffers a capture touched".
+    /// Holding gets reservation right and reuse wrong -- it is precisely what
+    /// stops (1) -- and holding only the buffers that were live when the region
+    /// opened gets reuse right and reservation wrong for everything born inside
+    /// it. The two properties have to be separated onto different memory, which
+    /// is what the arena is.
+    ///
+    /// Buffers that were live when the arena opened are NOT in it. They belong
+    /// to the ordinary pools, and if one dies inside the region its slice goes
+    /// back to a pool the region is not allocating from -- so it cannot be
+    /// handed to a later node of the same region. That is the whole of the
+    /// intra-region aliasing bug, closed structurally rather than by holding.
+    /// The caller still owes such a buffer a hold for the graph's lifetime, to
+    /// stop the pool handing it out AFTER the capture closes.
+    ///
+    /// TWO GRAPHS MAY SHARE ONE ARENA, and under (3) they positively should:
+    /// that is what makes their recorded addresses comparable, and it is what
+    /// lets a graph captured on one step stand in for the next. They then share
+    /// scratch, which is safe exactly when they are captures of the SAME region
+    /// and are replayed serially. Serial is a property of the one stream they
+    /// replay on; same-region is what [`Self::arena_signature`] is for.
+    pub fn arena_begin(&mut self) -> u64 {
+        self.arena_generation += 1;
+        self.arena_active = true;
+        self.arena_sizes.clear();
+        self.logger.log_memory(
+            |level| !matches!(level, MemoryLogLevel::Disabled),
+            || {
+                format!(
+                    "[{}] Capture arena open, generation {}",
+                    self.name, self.arena_generation
+                )
+            },
+        );
+        self.arena_generation
+    }
+
+    /// Stop routing `reserve` into the arena. The arena keeps everything it
+    /// owns: closing it is the end of allocation from it, never the end of its
+    /// reservation.
+    pub fn arena_end(&mut self) {
+        self.arena_active = false;
+    }
+
+    /// Whether `reserve` is currently being served from the arena.
+    pub fn arena_active(&self) -> bool {
+        self.arena_active
+    }
+
+    /// What the arena is holding, and how it got there.
+    pub fn arena_stats(&self) -> ArenaStats {
+        let usage = self.arena.get_memory_usage();
+        ArenaStats {
+            generation: self.arena_generation,
+            served: self.arena_served,
+            misses: self.arena_misses,
+            slices: self.arena.slice_count() as u64,
+            bytes_reserved: usage.bytes_reserved,
+            bytes_in_use: usage.bytes_in_use,
+        }
+    }
+
+    /// Zero the served/miss counters, so a capture pass can be counted apart
+    /// from the warm pass that preceded it. Does not free or reset anything.
+    pub fn arena_reset_counters(&mut self) {
+        self.arena_served = 0;
+        self.arena_misses = 0;
+    }
+
+    /// Give the arena's free pages back to the storage.
+    ///
+    /// Only legal once no captured graph built against it can still be
+    /// replayed -- every such graph holds pointers into these pages. Slices
+    /// still held by a live handle are kept.
+    pub fn arena_release(&mut self) {
+        assert!(
+            !self.arena_active,
+            "[{}] arena_release while the arena is open",
+            self.name
+        );
+        self.arena
+            .cleanup(&mut self.storage, self.alloc_reserve_count, true);
+    }
+
+    /// Whether this binding's memory came from the arena.
+    pub fn arena_owns(&self, binding: &ManagedMemoryBinding) -> bool {
+        binding.descriptor().location().pool == self.arena_pool_pos
+    }
+
+    /// How many requests the open arena window has served so far. A caller
+    /// brackets a region with two of these to name the window it owns.
+    pub fn arena_mark(&self) -> usize {
+        self.arena_sizes.len()
+    }
+
+    /// A hash of every size served since `from`, in order: the signature of the
+    /// region that allocated them. See [`Self::arena_sizes`].
+    pub fn arena_signature(&self, from: usize) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for size in &self.arena_sizes[from.min(self.arena_sizes.len())..] {
+            h ^= *size;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h
+    }
+
+    fn arena_reserve(&mut self, size: u64) -> Result<ManagedMemoryHandle, IoError> {
+        self.arena_served += 1;
+        self.arena_sizes.push(size);
+        if let Some(handle) = self.arena.try_reserve(size) {
+            return Ok(handle);
+        }
+        // A miss is a real driver allocation. Inside a capture that is a graph
+        // memory node; the warm pass exists so this branch is not taken then.
+        self.arena_misses += 1;
+        self.arena.alloc(&mut self.storage, size)
     }
 
     /// Cleanup allocations in pools that are deemed unnecessary.
@@ -420,6 +618,10 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     /// Returns the storage from the specified binding
     fn find(&self, binding: ManagedMemoryBinding) -> Result<&Slice, IoError> {
         let id = binding.descriptor();
+
+        if id.location().pool == self.arena_pool_pos {
+            return self.arena.find(&binding);
+        }
 
         if id.location().pool >= self.pools.len() as u8 {
             return self.persistent.find(&binding);
@@ -503,6 +705,13 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
         // If this happens every nanosecond, counts overflows after 585 years, so not worth thinking too
         // hard about overflow here.
         self.alloc_reserve_count += 1;
+
+        // The arena is not one pool among the others: while it is open it is
+        // the ONLY one, because an address a captured node records has to come
+        // from memory nothing outside the capture can be given.
+        if self.arena_active {
+            return self.arena_reserve(size);
+        }
 
         if let Some(val) = self.persistent.try_reserve(size) {
             self.logger.log_memory(
@@ -597,7 +806,9 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
             },
             |m1, m2| m1.combine(m2),
         );
-        memory_usage.combine(self.persistent.get_memory_usage())
+        memory_usage
+            .combine(self.persistent.get_memory_usage())
+            .combine(self.arena.get_memory_usage())
     }
 
     /// Print out a report of the current memory usage.
@@ -623,6 +834,9 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
         }
 
         let pool_index = descriptor.location().pool as usize;
+        if pool_index == self.arena_pool_pos as usize {
+            return self.arena.bind(reserved, assigned, cursor);
+        }
         if pool_index >= self.pools.len() {
             return self.persistent.bind(reserved, assigned, cursor);
         }
@@ -642,6 +856,15 @@ impl<Storage: ComputeStorage> core::fmt::Display for MemoryManagement<Storage> {
         f.write_str("\n# MemoryManagement\n\n")?;
         f.write_fmt(format_args!(" - name: {:?}\n", self.name))?;
         f.write_fmt(format_args!("\n## Persistent\n\n{}", self.persistent))?;
+        f.write_fmt(format_args!(
+            "\n## Capture arena (generation {}, {})\n\n{}",
+            self.arena_generation,
+            match self.arena_active {
+                true => "open",
+                false => "closed",
+            },
+            self.arena
+        ))?;
         f.write_str("\n## Dynamic\n\n")?;
 
         for pool in self.pools.iter() {

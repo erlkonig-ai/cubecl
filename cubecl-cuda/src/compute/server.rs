@@ -31,7 +31,7 @@ use cubecl_runtime::{
     compiler::CubeTask,
     config::{CubeClRuntimeConfig, RuntimeConfig},
     logging::ServerLogger,
-    memory_management::{ManagedMemoryHandle, MemoryAllocationMode, MemoryUsage},
+    memory_management::{ArenaStats, ManagedMemoryHandle, MemoryAllocationMode, MemoryUsage},
     server::ComputeServer,
     storage::{ComputeStorage, ManagedResource},
     stream::MultiStream,
@@ -70,6 +70,12 @@ pub struct CudaServer {
     /// into the [`CapturedGraph`] at `graph_capture_end`. This is the index a
     /// later parameter rewrite names its node by.
     capture_launches: Vec<CapturedLaunch>,
+    /// Where in the open arena window the capture began, so `graph_capture_end`
+    /// can sign the requests THIS capture made and not the warm pass's.
+    capture_arena_mark: usize,
+    /// The signature of the most recently closed capture. Every graph still
+    /// replayable must agree with it; see [`CapturedGraph::arena_signature`].
+    last_arena_signature: Option<u64>,
 }
 
 /// One launch a capture recorded, with everything needed to rewrite it.
@@ -105,6 +111,16 @@ fn capture_hold_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("CUBECL_GRAPH_HOLD").as_deref() != Ok("0"))
 }
 
+/// Whether a capture allocates from the CAPTURE ARENA. On, always, in any run
+/// whose answer matters; `CUBECL_GRAPH_ARENA=0` is the arm that shows what it is
+/// worth, in the same binary. With it off, a capture allocates from the ordinary
+/// pools and every buffer it binds is held -- which is correct, and is where the
+/// intra-region allocations that become graph MEMORY nodes come from.
+fn capture_arena_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_GRAPH_ARENA").as_deref() != Ok("0"))
+}
+
 /// One captured region: the graph, the executable instantiated from it, and
 /// every buffer its nodes hold a pointer to.
 ///
@@ -122,6 +138,28 @@ struct CapturedGraph {
     exec: cudarc::driver::sys::CUgraphExec,
     hold: Vec<Binding>,
     launches: Vec<CapturedLaunch>,
+    /// A hash of the sizes this capture asked the arena for, in order: the
+    /// signature of the REGION it recorded.
+    ///
+    /// Graphs that share an arena share its slices, which is deliberate --
+    /// without it two captures of one region would not be comparable and no
+    /// graph could stand in for another step. They then share scratch, and
+    /// that is safe exactly when they are captures of the same region,
+    /// replayed serially. Serial the single stream gives; same-region is this.
+    /// A graph whose signature disagrees with the last capture's is a graph
+    /// whose scratch is now somebody else's live memory, and it would compute
+    /// a plausible wrong answer rather than fail.
+    arena_signature: u64,
+    /// The pinned host buffers that captured H2D copies read FROM.
+    ///
+    /// A memcpy node records a source ADDRESS the same way a kernel node
+    /// records its arguments. The staging buffer for a metadata upload is
+    /// normally handed straight back to the pinned pool -- during a capture the
+    /// drop queue defers that, but the deferral ends when the capture does, and
+    /// then the pool is free to hand the same host page to something else while
+    /// the graph still copies out of it on every replay. Owning them here is
+    /// what makes the recorded source address mean what the node says it means.
+    staging: Vec<Bytes>,
 }
 
 // SAFETY: `CudaServer` is only accessed from one thread at a time via the `DeviceHandle`,
@@ -225,6 +263,47 @@ impl ComputeServer for CudaServer {
         self.raw_stream(stream_id, Some(defer));
     }
 
+    fn graph_arena_begin(&mut self, stream_id: StreamId) -> u64 {
+        // The ablation arm has to be the OLD path exactly, not the arena with
+        // its reuse suppressed by a full hold. With this off, nothing is ever
+        // routed here and a capture allocates from the ordinary pools.
+        if !capture_arena_enabled() {
+            return 0;
+        }
+        self.arena_command(stream_id)
+            .streams
+            .current()
+            .memory_management_gpu
+            .arena_begin()
+    }
+
+    fn graph_arena_end(&mut self, stream_id: StreamId) {
+        if !capture_arena_enabled() {
+            return;
+        }
+        self.arena_command(stream_id)
+            .streams
+            .current()
+            .memory_management_gpu
+            .arena_end();
+    }
+
+    fn graph_arena_stats(&mut self, stream_id: StreamId) -> ArenaStats {
+        self.arena_command(stream_id)
+            .streams
+            .current()
+            .memory_management_gpu
+            .arena_stats()
+    }
+
+    fn graph_arena_reset_counters(&mut self, stream_id: StreamId) {
+        self.arena_command(stream_id)
+            .streams
+            .current()
+            .memory_management_gpu
+            .arena_reset_counters();
+    }
+
     fn graph_capture_begin(&mut self, stream_id: StreamId) {
         use cudarc::driver::sys::CUstreamCaptureMode;
         let mode = match std::env::var("INK_GRAPH_CAPTURE_MODE").as_deref() {
@@ -234,6 +313,31 @@ impl ComputeServer for CudaServer {
         };
         self.unsafe_set_current();
         let stream = self.raw_stream(stream_id, Some(true));
+        if capture_arena_enabled() {
+            let open = self
+                .arena_command(stream_id)
+                .streams
+                .current()
+                .memory_management_gpu
+                .arena_active();
+            assert!(
+                open,
+                "graph_capture_begin with the capture arena closed. Every address this \
+                 capture is about to record would come from the ordinary pools, which are \
+                 free to hand the same slice to a later node of this same region and to \
+                 anything at all once the capture closes -- and neither shows up as a \
+                 failure, only as a wrong answer one step later. Call graph_arena_begin \
+                 first (once to warm, then again around the capture), or set \
+                 CUBECL_GRAPH_ARENA=0 to take the hold-everything arm deliberately."
+            );
+        }
+        let mark = self
+            .arena_command(stream_id)
+            .streams
+            .current()
+            .memory_management_gpu
+            .arena_mark();
+        self.capture_arena_mark = mark;
         crate::compute::CAPTURE_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
         self.capture_hold.clear();
         self.capture_launches.clear();
@@ -282,6 +386,15 @@ impl ComputeServer for CudaServer {
         self.next_graph_id += 1;
         let hold = core::mem::take(&mut self.capture_hold);
         let launches = core::mem::take(&mut self.capture_launches);
+        let mark = self.capture_arena_mark;
+        let (arena_signature, staging) = {
+            let mut command = self.arena_command(stream_id);
+            let stream = command.streams.current();
+            let staging = core::mem::take(&mut stream.capture_staging);
+            let sig = stream.memory_management_gpu.arena_signature(mark);
+            (sig, staging)
+        };
+        self.last_arena_signature = Some(arena_signature);
         self.graphs.insert(
             id,
             CapturedGraph {
@@ -289,12 +402,29 @@ impl ComputeServer for CudaServer {
                 exec,
                 hold,
                 launches,
+                arena_signature,
+                staging,
             },
         );
         id
     }
 
     fn graph_replay(&mut self, id: u64, stream_id: StreamId) {
+        if capture_arena_enabled() && let Some(last) = self.last_arena_signature {
+            let built = self
+                .graphs
+                .get(&id)
+                .unwrap_or_else(|| panic!("no captured graph with id {id}"))
+                .arena_signature;
+            assert_eq!(
+                built, last,
+                "graph {id} recorded a different sequence of arena requests than the most \
+                 recent capture did, so the two are not captures of the same region -- and \
+                 they share the arena's slices. Replaying this one now would compute on \
+                 scratch the other holds live, and would emit a PLAUSIBLE answer rather \
+                 than fail. Give a second region its own arena."
+            );
+        }
         self.unsafe_set_current();
         let stream = self.raw_stream(stream_id, None);
         let exec = self
@@ -1090,6 +1220,8 @@ impl CudaServer {
             next_graph_id: 1,
             capture_launches: Vec::new(),
             capture_hold: Vec::new(),
+            capture_arena_mark: 0,
+            last_arena_signature: None,
         }
     }
 
@@ -1136,6 +1268,22 @@ impl CudaServer {
         // TODO: Should check if on the same thread before calling it, since now we don't switch
         // thread except for device memory transfer.
         self.ctx.unsafe_set_current().unwrap();
+    }
+
+    /// A command on `stream_id` for touching the allocator only: no inputs to
+    /// resolve, no flush (a flush waits on a fence, which a capture cannot
+    /// contain), and errors ignored because there is no work being enqueued.
+    fn arena_command(&mut self, stream_id: StreamId) -> Command<'_> {
+        match self.command_no_inputs(
+            stream_id,
+            StreamErrorMode {
+                ignore: true,
+                flush: false,
+            },
+        ) {
+            Ok(val) => val,
+            Err(err) => unreachable!("{err:?}"),
+        }
     }
 
     fn command<'a>(
@@ -1260,13 +1408,45 @@ impl CudaServer {
         };
         let capturing = capture_open && capture_hold_enabled();
         if capturing {
-            hold_now.extend(bindings.tensor_maps.iter().map(|it| it.binding.clone()));
-            hold_now.extend(bindings.buffers.iter().cloned());
+            // WHICH buffers this launch owes a hold, and why it is not all of
+            // them once there is an arena.
+            //
+            // A hold does two different jobs at once, and the arena splits
+            // them. It keeps a slice ALLOCATED, and it keeps the slice from
+            // being handed to anyone else. For a buffer born inside the
+            // captured region the arena already does both -- it never returns
+            // a page to the storage and it is only ever allocated from while a
+            // capture is open -- and holding one on top of that does active
+            // harm: it stops the arena RECYCLING the slice inside the region,
+            // so every intra-region allocation has to be a fresh one, and a
+            // fresh allocation made while the stream is capturing is a graph
+            // memory node rather than a pointer.
+            //
+            // A buffer that was already live when the region opened is a
+            // different case and still owes a hold. It belongs to the ordinary
+            // pools; if it dies inside the region its slice goes back there,
+            // and once the capture closes the pool is free to hand it to
+            // anything, while this graph still reads it on every replay.
+            let arena = capture_arena_enabled();
+            let mut owe = |command: &mut Command<'_>, b: &Binding| {
+                if !arena || !command.arena_owns(b) {
+                    hold_now.push(b.clone());
+                }
+            };
+            for it in bindings.tensor_maps.iter() {
+                owe(&mut command, &it.binding);
+            }
+            for b in bindings.buffers.iter() {
+                owe(&mut command, b);
+            }
             // The metadata buffer `create_with_data` just produced is bound
             // below and dies at the end of this call, which makes it the FIRST
-            // slice the allocator offers the next launch of the same region.
+            // slice the allocator offers the next launch of the same region --
+            // and with an arena that is exactly right, so it is exactly what
+            // must NOT be held.
             if let Some(h) = info_binding.as_ref() {
-                hold_now.push(h.clone().binding());
+                let b = h.clone().binding();
+                owe(&mut command, &b);
             }
         }
 

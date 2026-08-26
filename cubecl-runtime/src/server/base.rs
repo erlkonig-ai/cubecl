@@ -5,7 +5,7 @@ use crate::{
     config::{CubeClRuntimeConfig, RuntimeConfig, compilation::BoundsCheckMode},
     kernel::KernelMetadata,
     logging::ServerLogger,
-    memory_management::{ManagedMemoryHandle, MemoryAllocationMode, MemoryUsage},
+    memory_management::{ArenaStats, ManagedMemoryHandle, MemoryAllocationMode, MemoryUsage},
     runtime::Runtime,
     server::Binding,
     storage::{ComputeStorage, ManagedResource},
@@ -356,6 +356,41 @@ where
     fn graph_defer_frees(&mut self, _defer: bool, _stream_id: StreamId) {
         panic!("graph capture is not supported by this backend");
     }
+
+    /// Route every allocation on `stream_id` into the CAPTURE ARENA, and
+    /// return the generation this opening is.
+    ///
+    /// Call this once to WARM (arena open, no capture: the region runs eagerly
+    /// and the arena learns exactly which slices it needs), then again around
+    /// the capture itself. See
+    /// [`MemoryManagement::arena_begin`](crate::memory_management::MemoryManagement::arena_begin)
+    /// for why an arena and not a hold.
+    ///
+    /// Reopening the arena and capturing again DELIBERATELY hands the second
+    /// graph the same slices: that is what makes two captures of one region
+    /// comparable, and what lets one graph stand in for another step. The two
+    /// then share scratch, which is safe exactly when they are captures of the
+    /// same region -- checked by the request sequence each capture recorded --
+    /// and replayed serially, which the single stream gives for free.
+    fn graph_arena_begin(&mut self, _stream_id: StreamId) -> u64 {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Stop routing allocations into the arena. The arena keeps every page it
+    /// owns -- closing it ends allocation from it, never its reservation.
+    fn graph_arena_end(&mut self, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// What the arena holds, and how many requests it had to take from the
+    /// driver. A miss taken while a capture is open is a graph memory node.
+    fn graph_arena_stats(&mut self, _stream_id: StreamId) -> ArenaStats {
+        ArenaStats::default()
+    }
+
+    /// Zero the arena's served/miss counters so the capture pass can be
+    /// counted apart from the warm pass.
+    fn graph_arena_reset_counters(&mut self, _stream_id: StreamId) {}
 
     /// Begin capturing work enqueued on `stream_id` instead of running it.
     /// Between this and [`ComputeServer::graph_capture_end`] nothing executes;

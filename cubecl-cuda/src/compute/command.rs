@@ -88,6 +88,15 @@ impl<'a> Command<'a> {
             .get_resource(binding.memory, binding.offset_start, binding.offset_end)
     }
 
+    /// Whether this binding's memory came out of the capture arena, i.e.
+    /// whether it was born inside the region being captured.
+    pub fn arena_owns(&mut self, binding: &Binding) -> bool {
+        self.streams
+            .get(&binding.stream)
+            .memory_management_gpu
+            .arena_owns(&binding.memory)
+    }
+
     /// Get the stream cursor.
     pub fn cursor(&self) -> u64 {
         self.streams.cursor
@@ -434,7 +443,26 @@ impl<'a> Command<'a> {
             )
         }?;
 
-        current.drop_queue.push(data);
+        // A copy recorded into a graph has not happened yet, and its node holds
+        // this buffer's host ADDRESS. Returning it to the pinned pool when the
+        // capture's deferral lifts would leave the node reading a page the pool
+        // has since handed to someone else -- on every replay, and with no
+        // failure, just different bytes. So the capture owns it instead.
+        //
+        // The cost of owning it is that the buffer never comes back, so a
+        // SECOND capture of the same region needs a second set. The pinned pool
+        // grows to meet that, and growing it inside a capture is a
+        // `cuMemAllocHost` on a capturing stream, which fails. Until the graph
+        // owns its own host source memory outright -- copy the bytes aside at
+        // capture end and repoint the node with `cuGraphExecMemcpyNodeSetParams`
+        // -- `CUBECL_GRAPH_STAGE_OWN=0` is the arm that keeps today's behaviour,
+        // hazard included, for a run that captures twice.
+        match crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed)
+            && capture_stage_own()
+        {
+            true => current.capture_staging.push(data),
+            false => current.drop_queue.push(data),
+        }
 
         Ok(())
     }
@@ -665,6 +693,13 @@ pub struct CapturedNode {
     feature = "tracing",
     tracing::instrument(level = "trace", skip(strides, data, dst_ptr, stream))
 )]
+/// Whether a capture OWNS the pinned host buffers its memcpy nodes read from.
+/// On by default; see the comment at its only use.
+fn capture_stage_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_GRAPH_STAGE_OWN").as_deref() != Ok("0"))
+}
+
 pub(crate) unsafe fn write_to_gpu(
     shape: &Shape,
     strides: &Strides,

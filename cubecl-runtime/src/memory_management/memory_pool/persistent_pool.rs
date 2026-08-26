@@ -57,6 +57,11 @@ impl PersistentPool {
         }
     }
 
+    /// How many slices this pool owns, free or not.
+    pub fn slice_count(&self) -> usize {
+        self.slices.len()
+    }
+
     pub fn has_size(&mut self, size: u64) -> bool {
         let padding = calculate_padding(size, self.alignment);
         let effective_size = size + padding;

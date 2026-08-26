@@ -2,7 +2,7 @@ use crate::{
     config::{TypeNameFormatLevel, type_name_format},
     kernel::KernelMetadata,
     logging::ProfileLevel,
-    memory_management::{MemoryAllocationMode, MemoryUsage},
+    memory_management::{ArenaStats, MemoryAllocationMode, MemoryUsage},
     runtime::Runtime,
     server::{
         CommunicationId, ComputeServer, CopyDescriptor, CubeCount, ExecutionMode,
@@ -491,6 +491,38 @@ impl<R: Runtime> ComputeClient<R> {
         let stream_id = self.stream_id();
         self.device
             .submit_blocking(move |server| server.graph_defer_frees(defer, stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_arena_begin`].
+    pub fn graph_arena_begin(&self) -> u64 {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_arena_begin(stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_arena_end`].
+    pub fn graph_arena_end(&self) {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_arena_end(stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_arena_stats`].
+    pub fn graph_arena_stats(&self) -> ArenaStats {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_arena_stats(stream_id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_arena_reset_counters`].
+    pub fn graph_arena_reset_counters(&self) {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| server.graph_arena_reset_counters(stream_id))
             .unwrap()
     }
 

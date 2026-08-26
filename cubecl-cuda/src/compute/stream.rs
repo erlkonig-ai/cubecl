@@ -32,6 +32,15 @@ pub struct Stream {
     /// actually does -- invalidates the capture, and `cuStreamEndCapture` then
     /// hands back a null graph with no other complaint.
     pub capturing: bool,
+    /// Pinned host buffers that H2D copies recorded INTO A GRAPH read from.
+    ///
+    /// Outside a capture a staging buffer goes to `drop_queue` and is back in
+    /// the pinned pool a few launches later, which is right: the copy has by
+    /// then either run or been ordered behind a fence. Inside a capture the
+    /// copy has not run and will not run until a replay, possibly many times,
+    /// and the node holds the buffer's ADDRESS. So the capture takes ownership
+    /// instead, and `graph_capture_end` moves these into the graph.
+    pub capture_staging: Vec<cubecl_common::bytes::Bytes>,
 }
 
 impl drop_queue::Fence for Fence {
@@ -86,6 +95,7 @@ impl EventStreamBackend for CudaStreamBackend {
             memory_management_cpu,
             errors: Vec::new(),
             drop_queue: Default::default(),
+            capture_staging: Vec::new(),
         }
     }
 
