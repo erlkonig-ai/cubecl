@@ -431,6 +431,53 @@ where
         panic!("graph capture is not supported by this backend");
     }
 
+    /// A census of the graph's nodes by KIND, as `(CUgraphNodeType, count)`.
+    ///
+    /// A graph is not only its kernels. Everything else a capture recorded --
+    /// host-to-device copies, memsets, child graphs -- is a node too, and a
+    /// node no kernel-parameter rewrite can reach. Whether a region is
+    /// replayable on a later step is therefore first of all a question about
+    /// how much of it is NOT a kernel launch.
+    fn graph_node_kinds(&mut self, _id: u64) -> Vec<(u32, usize)> {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Rewrite several launches of one graph in a single round trip.
+    ///
+    /// Per-launch [`ComputeServer::graph_patch_launch`] is one submit each, and
+    /// on a region with a hundred moving launches the submits cost far more
+    /// than the rewrites do. The batch exists because that overhead is the
+    /// caller's to avoid, not something to measure and report as the price of
+    /// patching.
+    fn graph_patch_launches(&mut self, _id: u64, _patches: Vec<(usize, GraphLaunchPatch)>) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Every `(address, bytes)` the graph ALLOCATES for itself.
+    ///
+    /// A capture that could not avoid allocating turns each allocation into a
+    /// memory node, and the memory a graph owns has a virtual address the graph
+    /// fixes -- the same one on every launch of that exec, and NOT the same one
+    /// as any other graph's. So these addresses are already pinned for as long
+    /// as one exec is being replayed, and rewriting them to another graph's is
+    /// wrong by construction rather than merely unnecessary. A caller
+    /// re-pointing a region's buffers has to be able to tell them apart from
+    /// the ones that came from the pool.
+    fn graph_alloc_regions(&mut self, _id: u64) -> Vec<(u64, u64)> {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Every memcpy node's `(src, dst, bytes, kind)`, sorted.
+    ///
+    /// A capture records copies as well as launches, and a copy is not a
+    /// kernel: no parameter rewrite reaches it. When the data a copy carries is
+    /// per-step, the region is not replayable on a later step no matter how
+    /// well its kernels are patched, and this is how that is checked rather
+    /// than assumed.
+    fn graph_memcpy_specs(&mut self, _id: u64) -> Vec<(u64, u64, u64, u32)> {
+        panic!("graph capture is not supported by this backend");
+    }
+
     /// Release a captured graph. An unknown id is ignored.
     fn graph_destroy(&mut self, _id: u64) {}
 

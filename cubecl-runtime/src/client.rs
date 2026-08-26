@@ -572,6 +572,34 @@ impl<R: Runtime> ComputeClient<R> {
             .unwrap()
     }
 
+    /// See [`ComputeServer::graph_node_kinds`].
+    pub fn graph_node_kinds(&self, id: u64) -> Vec<(u32, usize)> {
+        self.device
+            .submit_blocking(move |server| server.graph_node_kinds(id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_patch_launches`].
+    pub fn graph_patch_launches(&self, id: u64, patches: Vec<(usize, GraphLaunchPatch)>) {
+        self.device
+            .submit_blocking(move |server| server.graph_patch_launches(id, patches))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_alloc_regions`].
+    pub fn graph_alloc_regions(&self, id: u64) -> Vec<(u64, u64)> {
+        self.device
+            .submit_blocking(move |server| server.graph_alloc_regions(id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_memcpy_specs`].
+    pub fn graph_memcpy_specs(&self, id: u64) -> Vec<(u64, u64, u64, u32)> {
+        self.device
+            .submit_blocking(move |server| server.graph_memcpy_specs(id))
+            .unwrap()
+    }
+
     /// See [`ComputeServer::graph_destroy`].
     pub fn graph_destroy(&self, id: u64) {
         self.device

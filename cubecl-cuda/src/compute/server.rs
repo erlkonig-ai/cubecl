@@ -446,6 +446,148 @@ impl ComputeServer for CudaServer {
         }
     }
 
+    fn graph_node_kinds(&mut self, id: u64) -> Vec<(u32, usize)> {
+        use cudarc::driver::sys::{CUgraphNode, cuGraphGetNodes, cuGraphNodeGetType};
+        let graph = self.captured(id).graph;
+        let mut n: usize = 0;
+        // SAFETY: `graph` is a live captured graph. A null node array asks for
+        // the count only, which is the documented two-call form.
+        unsafe {
+            cuGraphGetNodes(graph, core::ptr::null_mut(), &mut n)
+                .result()
+                .expect("the graph to report its node count");
+        }
+        let mut nodes: Vec<CUgraphNode> = vec![core::ptr::null_mut(); n];
+        // SAFETY: `nodes` has room for exactly the `n` the call above reported.
+        unsafe {
+            cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut n)
+                .result()
+                .expect("the graph to list its nodes");
+        }
+        let mut counts: HashMap<u32, usize> = HashMap::default();
+        for node in nodes.into_iter().take(n) {
+            let mut kind = core::mem::MaybeUninit::uninit();
+            // SAFETY: `node` came from `cuGraphGetNodes` on a live graph.
+            let kind = unsafe {
+                cuGraphNodeGetType(node, kind.as_mut_ptr())
+                    .result()
+                    .expect("a graph node to report its type");
+                kind.assume_init()
+            };
+            *counts.entry(kind as u32).or_default() += 1;
+        }
+        let mut out: Vec<(u32, usize)> = counts.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn graph_patch_launches(&mut self, id: u64, patches: Vec<(usize, GraphLaunchPatch)>) {
+        for (idx, patch) in patches {
+            self.graph_patch_launch(id, idx, patch);
+        }
+    }
+
+    fn graph_alloc_regions(&mut self, id: u64) -> Vec<(u64, u64)> {
+        use cudarc::driver::sys::{
+            CUDA_MEM_ALLOC_NODE_PARAMS, CUgraphNode, CUgraphNodeType, cuGraphGetNodes,
+            cuGraphMemAllocNodeGetParams, cuGraphNodeGetType,
+        };
+        let graph = self.captured(id).graph;
+        let mut n: usize = 0;
+        // SAFETY: `graph` is a live captured graph; the null array asks for the
+        // count only, which is the documented two-call form.
+        unsafe {
+            cuGraphGetNodes(graph, core::ptr::null_mut(), &mut n)
+                .result()
+                .expect("the graph to report its node count");
+        }
+        let mut nodes: Vec<CUgraphNode> = vec![core::ptr::null_mut(); n];
+        // SAFETY: `nodes` has room for exactly the `n` reported above.
+        unsafe {
+            cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut n)
+                .result()
+                .expect("the graph to list its nodes");
+        }
+        let mut out = Vec::new();
+        for node in nodes.into_iter().take(n) {
+            // SAFETY: `node` came from `cuGraphGetNodes` on a live graph.
+            let kind = unsafe {
+                let mut k = core::mem::MaybeUninit::uninit();
+                cuGraphNodeGetType(node, k.as_mut_ptr())
+                    .result()
+                    .expect("a graph node to report its type");
+                k.assume_init()
+            };
+            if kind != CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC {
+                continue;
+            }
+            // SAFETY: the node's type was just checked to be MEM_ALLOC, which
+            // is the precondition for reading its allocation parameters.
+            let params: CUDA_MEM_ALLOC_NODE_PARAMS = unsafe {
+                let mut p = core::mem::MaybeUninit::zeroed();
+                cuGraphMemAllocNodeGetParams(node, p.as_mut_ptr())
+                    .result()
+                    .expect("a memory node to report what it allocates");
+                p.assume_init()
+            };
+            out.push((params.dptr, params.bytesize as u64));
+        }
+        out.sort_unstable();
+        out
+    }
+
+    fn graph_memcpy_specs(&mut self, id: u64) -> Vec<(u64, u64, u64, u32)> {
+        use cudarc::driver::sys::{
+            CUDA_MEMCPY3D, CUgraphNode, CUgraphNodeType, cuGraphGetNodes,
+            cuGraphMemcpyNodeGetParams, cuGraphNodeGetType,
+        };
+        let graph = self.captured(id).graph;
+        let mut n: usize = 0;
+        // SAFETY: `graph` is live; the null array asks for the count only.
+        unsafe {
+            cuGraphGetNodes(graph, core::ptr::null_mut(), &mut n)
+                .result()
+                .expect("the graph to report its node count");
+        }
+        let mut nodes: Vec<CUgraphNode> = vec![core::ptr::null_mut(); n];
+        // SAFETY: `nodes` has room for exactly the `n` reported above.
+        unsafe {
+            cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut n)
+                .result()
+                .expect("the graph to list its nodes");
+        }
+        let mut out = Vec::new();
+        for node in nodes.into_iter().take(n) {
+            // SAFETY: `node` came from `cuGraphGetNodes` on a live graph.
+            let kind = unsafe {
+                let mut k = core::mem::MaybeUninit::uninit();
+                cuGraphNodeGetType(node, k.as_mut_ptr())
+                    .result()
+                    .expect("a graph node to report its type");
+                k.assume_init()
+            };
+            if kind != CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY {
+                continue;
+            }
+            // SAFETY: the node's type was just checked to be MEMCPY.
+            let p: CUDA_MEMCPY3D = unsafe {
+                let mut p = core::mem::MaybeUninit::zeroed();
+                cuGraphMemcpyNodeGetParams(node, p.as_mut_ptr())
+                    .result()
+                    .expect("a memcpy node to report its parameters");
+                p.assume_init()
+            };
+            let src = core::cmp::max(p.srcDevice, p.srcHost as u64);
+            let dst = core::cmp::max(p.dstDevice, p.dstHost as u64);
+            let bytes = (p.WidthInBytes as u64)
+                * (p.Height.max(1) as u64)
+                * (p.Depth.max(1) as u64);
+            out.push((src, dst, bytes, p.srcMemoryType as u32));
+        }
+        out.sort_unstable();
+        out
+    }
+
     fn graph_destroy(&mut self, id: u64) {
         if let Some(g) = self.graphs.remove(&id) {
             self.unsafe_set_current();
