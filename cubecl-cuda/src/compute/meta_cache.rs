@@ -145,7 +145,7 @@ fn capacity() -> usize {
     })
 }
 
-/// Print a one-line summary every this many lookups, from
+/// Print a one-line summary every this many metadata launches, from
 /// `CUBECL_META_CACHE_STATS`. Zero (the default) prints nothing.
 fn stats_every() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -155,6 +155,45 @@ fn stats_every() -> u64 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     })
+}
+
+/// Whether the metadata half of a launch times itself, from
+/// `CUBECL_TIME_META_CACHE`. Read once: a `getenv` per launch would be a cost
+/// on the path this exists to measure.
+///
+/// WHAT THE NUMBER IS, and it is the whole reason this knob exists rather than
+/// a hit-rate alone. With the cache OFF every metadata launch is charged as a
+/// MISS, and the miss time is then the cost of the thing the cache replaces:
+/// a pinned reserve, a host memcpy, a device reservation and a
+/// `cuMemcpyHtoDAsync` enqueue. With the cache ON the hit time is what it
+/// costs instead: a hash of at most a few hundred bytes, a map probe and a
+/// full-payload comparison. The two arms of one binary therefore answer "what
+/// does a hit cost against the upload it replaces" directly, in the same units,
+/// rather than by inference from a count.
+///
+/// FRAMING: it is the METADATA half of `launch_checked` only -- the lookup, or
+/// the lookup plus the buffer it had to build -- per LAUNCH THAT BINDS A RANKED
+/// TENSOR. It is not the launch, it does not include the driver's
+/// `cuLaunchKernel`, and it does not include the device time of the copy it
+/// enqueues. Off by default: it costs two clock reads a launch, so the timed
+/// arm is slower than the arm it measures.
+fn time_meta() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_TIME_META_CACHE").as_deref() == Ok("1"))
+}
+
+/// Whether the launch path accounts for the metadata half at all. False by
+/// default, and then a launch pays nothing for this module beyond the map
+/// probe the cache itself is.
+pub fn observing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| stats_every() > 0 || time_meta())
+}
+
+/// Whether to start a clock for [`observe`]. `None` when the timing is off, so
+/// the caller's `Instant::now` is not paid for.
+pub fn clock() -> Option<std::time::Instant> {
+    time_meta().then(std::time::Instant::now)
 }
 
 /// Process-wide counters. The cache itself is per stream; the counters are not,
@@ -168,6 +207,55 @@ static BYPASSED: AtomicU64 = AtomicU64::new(0);
 static INSERTS: AtomicU64 = AtomicU64::new(0);
 static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static BYTES_SAVED: AtomicU64 = AtomicU64::new(0);
+static HIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static MISS_NANOS: AtomicU64 = AtomicU64::new(0);
+/// The cumulative counters as of the last report, so a report can print a
+/// WINDOW as well as a total. A window is what separates the prefill from the
+/// decode steps: the two do different amounts of this work and a run-long mean
+/// is the wrong number for either.
+static LAST: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Account for one launch's metadata half.
+///
+/// Called from the launch path in EVERY mode, including `Off`, and only when
+/// [`observing`] -- which is what lets the off arm report the cost of the
+/// upload the on arm elides. `hit` is whether the cache supplied the buffer;
+/// with the cache off it is always false and the launch is charged as a miss,
+/// which is exactly what it is.
+pub fn observe(
+    hit: bool,
+    mode: MetaCacheMode,
+    capture_open: bool,
+    bytes: usize,
+    since: Option<std::time::Instant>,
+) {
+    if capture_open && mode == MetaCacheMode::Eager {
+        BYPASSED.fetch_add(1, Ordering::Relaxed);
+    }
+    let n = LOOKUPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let nanos = since.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+    match hit {
+        true => {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            HIT_NANOS.fetch_add(nanos, Ordering::Relaxed);
+            BYTES_SAVED.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        false => {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            MISS_NANOS.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+    let every = stats_every();
+    if every > 0 && n % every == 0 {
+        report();
+    }
+}
 
 /// One cached shape-and-stride list, and the device buffer that holds it.
 #[derive(Debug)]
@@ -209,13 +297,10 @@ impl MetaCache {
             return None;
         }
         if capture_open && mode != MetaCacheMode::Captures {
-            BYPASSED.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let n = LOOKUPS.fetch_add(1, Ordering::Relaxed) + 1;
         self.clock += 1;
-        let key = hash(bytes);
-        let out = match self.entries.get_mut(&key) {
+        match self.entries.get_mut(&hash(bytes)) {
             // A hash match whose bytes DIFFER is the collision this design
             // exists to catch. Counted, and then served by the ordinary upload
             // path: the entry is left alone rather than replaced, so the
@@ -223,26 +308,15 @@ impl MetaCache {
             // for its upload. Both are correct; neither is silent.
             Some(e) if e.bytes != bytes => {
                 COLLISIONS.fetch_add(1, Ordering::Relaxed);
-                MISSES.fetch_add(1, Ordering::Relaxed);
                 None
             }
             Some(e) => {
                 e.last_used = self.clock;
                 e.pinned |= capture_open;
-                HITS.fetch_add(1, Ordering::Relaxed);
-                BYTES_SAVED.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 Some(e.handle.clone())
             }
-            None => {
-                MISSES.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-        };
-        let every = stats_every();
-        if every > 0 && n % every == 0 {
-            report();
+            None => None,
         }
-        out
     }
 
     /// Remember that `handle` holds `bytes`.
@@ -321,28 +395,62 @@ fn hash(bytes: &[u8]) -> u64 {
     h
 }
 
-/// One line, with every number's framing rule in it: these are counts SINCE
-/// PROCESS START, over every stream, for whatever the run has done so far.
+/// Two lines, each carrying its own framing rule.
+///
+/// The TOTAL line is counts since process start, over every stream. The WINDOW
+/// line is the same counts since the previous report, which is the one that
+/// separates a prefill from a decode step: set `CUBECL_META_CACHE_STATS` to
+/// roughly one step's metadata launches and each window is about one pass.
+///
+/// The two mean times are per LAUNCH THAT BINDS A RANKED TENSOR, and they are
+/// the whole point of the timing: `hit` is what the cache costs, `miss` is what
+/// the upload it replaces costs, in the same units, in the same binary. They
+/// print as `--` unless `CUBECL_TIME_META_CACHE=1`.
 fn report() {
-    let (lookups, hits, misses) = (
+    let now = [
         LOOKUPS.load(Ordering::Relaxed),
         HITS.load(Ordering::Relaxed),
         MISSES.load(Ordering::Relaxed),
-    );
-    let rate = match lookups {
+        HIT_NANOS.load(Ordering::Relaxed),
+        MISS_NANOS.load(Ordering::Relaxed),
+    ];
+    let prev: Vec<u64> = LAST.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    for (a, v) in LAST.iter().zip(now.iter()) {
+        a.store(*v, Ordering::Relaxed);
+    }
+    let mean = |nanos: u64, n: u64| match (time_meta(), n) {
+        (false, _) => "--".to_string(),
+        (true, 0) => "n/a".to_string(),
+        (true, n) => format!("{:.0} ns", nanos as f64 / n as f64),
+    };
+    let rate = |h: u64, l: u64| match l {
         0 => 0.0,
-        n => 100.0 * hits as f64 / n as f64,
+        l => 100.0 * h as f64 / l as f64,
     };
     eprintln!(
-        "[meta-cache] since process start: {lookups} lookups, {hits} hits ({rate:.1}%), \
-         {misses} misses, {} uploads elided carrying {} bytes, {} inserts, {} evictions, \
-         {} hash collisions caught, {} lookups bypassed inside a capture",
-        hits,
+        "[meta-cache] TOTAL since process start: {} metadata launches, {} hits ({:.1}%), \
+         {} misses, {} bytes not uploaded, {} entries inserted, {} evicted, \
+         {} hash collisions caught, {} bypassed inside a capture; \
+         mean per launch: hit {}, miss {}",
+        now[0],
+        now[1],
+        rate(now[1], now[0]),
+        now[2],
         BYTES_SAVED.load(Ordering::Relaxed),
         INSERTS.load(Ordering::Relaxed),
         EVICTIONS.load(Ordering::Relaxed),
         COLLISIONS.load(Ordering::Relaxed),
         BYPASSED.load(Ordering::Relaxed),
+        mean(now[3], now[1]),
+        mean(now[4], now[2]),
+    );
+    let (dl, dh, dm) = (now[0] - prev[0], now[1] - prev[1], now[2] - prev[2]);
+    eprintln!(
+        "[meta-cache] WINDOW since last report: {dl} metadata launches, {dh} hits \
+         ({:.1}%), {dm} misses; mean per launch: hit {}, miss {}",
+        rate(dh, dl),
+        mean(now[3] - prev[3], dh),
+        mean(now[4] - prev[4], dm),
     );
 }
 

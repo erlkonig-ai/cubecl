@@ -6,7 +6,7 @@ use crate::{
         command::Command,
         communication::{external_comm, get_nccl_comm_id, get_nccl_dtype_count, to_nccl_op},
         context::CudaContext,
-        meta_cache::MetaCacheMode,
+        meta_cache::{self, MetaCacheMode},
         stream::CudaStreamBackend,
         sync::Fence,
     },
@@ -1532,10 +1532,15 @@ impl CudaServer {
                 // per stream, and what it does and does not do inside a
                 // capture. Off unless `CUBECL_META_CACHE` says otherwise, in
                 // which case this is one `None` and today's path exactly.
+                // The clock, and whether this launch is accounted for at all.
+                // Both are off by default, and then the metadata half costs
+                // exactly what it costs today plus the map probe -- OFF has to
+                // be today's path, including what it costs.
+                let observe = meta_cache::observing();
+                let since = meta_cache::clock();
                 // Guarded rather than left to `get`'s own early return, so
                 // that with the cache off this launch does not even resolve
-                // the stream: OFF has to be today's path exactly, including
-                // what it costs.
+                // the stream.
                 let cached = match meta_mode.enabled() {
                     true => command
                         .streams
@@ -1544,8 +1549,9 @@ impl CudaServer {
                         .get(dyn_meta, meta_mode, capture_open),
                     false => None,
                 };
+                let hit = cached.is_some();
                 handle = Some(match cached {
-                    Some(hit) => hit,
+                    Some(buffer) => buffer,
                     None => {
                         let fresh = command.create_with_data(dyn_meta)?;
                         // WHAT MAY BE REMEMBERED, and the two things that rule
@@ -1574,6 +1580,9 @@ impl CudaServer {
                         fresh
                     }
                 });
+                if observe {
+                    meta_cache::observe(hit, meta_mode, capture_open, dyn_meta.len(), since);
+                }
             }
 
             (Some(info.data.as_ptr() as *mut c_void), handle)
