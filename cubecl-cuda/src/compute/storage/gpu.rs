@@ -244,6 +244,15 @@ impl ComputeStorage for GpuStorage {
                     ""
                 }
             );
+            // WHICH call took it. A page taken inside a capture is named by its
+            // size and nothing else, and a size is not a caller -- the last one
+            // to escape a 21-layer Inkling capture was 32768 bytes, which
+            // several tensors in that region could have been. Off by default
+            // because a backtrace per allocation is not free; on for exactly
+            // the run that is hunting one.
+            if in_capture && std::env::var("CUBECL_GRAPH_TRACE_BT").as_deref() == Ok("1") {
+                eprintln!("[graph-trace] taken by:\n{}", std::backtrace::Backtrace::force_capture());
+            }
         }
         let ptr = unsafe { cudarc::driver::result::malloc_async(self.stream, size as usize) };
         let (ptr, kind) = match ptr {
