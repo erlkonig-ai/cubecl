@@ -346,46 +346,19 @@ fn report() {
     );
 }
 
-/// The counters, for a caller that wants them at a point of its own choosing
-/// rather than every N lookups.
-pub fn stats() -> MetaCacheStats {
-    MetaCacheStats {
-        lookups: LOOKUPS.load(Ordering::Relaxed),
-        hits: HITS.load(Ordering::Relaxed),
-        misses: MISSES.load(Ordering::Relaxed),
-        collisions: COLLISIONS.load(Ordering::Relaxed),
-        bypassed: BYPASSED.load(Ordering::Relaxed),
-        inserts: INSERTS.load(Ordering::Relaxed),
-        evictions: EVICTIONS.load(Ordering::Relaxed),
-        bytes_saved: BYTES_SAVED.load(Ordering::Relaxed),
-    }
-}
-
-/// Counts since process start, over every stream.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MetaCacheStats {
-    /// Times the cache was consulted.
-    pub lookups: u64,
-    /// Lookups that bound a buffer already holding the payload.
-    pub hits: u64,
-    /// Lookups that did not, and paid for an upload.
-    pub misses: u64,
-    /// Hash matches whose bytes differed, served by the upload path.
-    pub collisions: u64,
-    /// Launches inside a capture that never reached the cache, under
-    /// [`MetaCacheMode::Eager`].
-    pub bypassed: u64,
-    /// Payloads remembered.
-    pub inserts: u64,
-    /// Entries dropped to stay under the bound.
-    pub evictions: u64,
-    /// Bytes that would have crossed the bus and did not.
-    pub bytes_saved: u64,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::hash;
+    use super::{Entry, MetaCache, MetaCacheMode, hash};
+    use cubecl_common::stream_id::StreamId;
+    use cubecl_core::server::Handle;
+
+    /// A handle carrying nothing but an identity. `MetaCache` never reads a
+    /// handle's memory -- it stores one and hands clones back -- so a bare
+    /// `Handle::new` is the whole of what these tests need, and they run with
+    /// no device.
+    fn handle(size: u64) -> Handle {
+        Handle::new(StreamId::current(), size)
+    }
 
     /// The length seed is load-bearing: without it a payload and its own
     /// prefix-extension by zero bytes are not distinguished by FNV-1a's own
@@ -400,5 +373,86 @@ mod tests {
     fn hash_is_deterministic() {
         let bytes: Vec<u8> = (0..208u16).map(|i| i as u8).collect();
         assert_eq!(hash(&bytes), hash(&bytes.clone()));
+    }
+    #[test]
+    fn a_hit_hands_back_the_buffer_that_holds_those_bytes() {
+        let mut c = MetaCache::default();
+        c.insert(&[1, 2, 3, 4], handle(11));
+        c.insert(&[9, 9, 9, 9], handle(22));
+        let hit = c
+            .get(&[1, 2, 3, 4], MetaCacheMode::Eager, false)
+            .expect("the payload was inserted");
+        assert_eq!(
+            hit.size(),
+            11,
+            "a hit must name the buffer holding ITS bytes"
+        );
+        assert!(c.get(&[7, 7], MetaCacheMode::Eager, false).is_none());
+    }
+
+    /// The point of keeping the full bytes. A hash match whose payload differs
+    /// must be a MISS -- the caller then uploads, which is correct -- and not a
+    /// handle to somebody else's shapes, which would be a wrong kernel that
+    /// does not fail.
+    #[test]
+    fn a_hash_match_with_different_bytes_is_a_miss() {
+        let mut c = MetaCache::default();
+        let probe: &[u8] = &[1, 2, 3, 4];
+        // Planted directly: two payloads that really collide under FNV-1a are
+        // not constructible by hand, and what is under test is the VERIFY, not
+        // the hash.
+        c.entries.insert(
+            hash(probe),
+            Entry {
+                bytes: vec![5, 6, 7, 8],
+                handle: handle(33),
+                last_used: 0,
+                pinned: false,
+            },
+        );
+        assert!(c.get(probe, MetaCacheMode::Eager, false).is_none());
+        // And the incumbent is left alone, so its own lookups still hit.
+        assert_eq!(
+            c.get(&[5, 6, 7, 8], MetaCacheMode::Eager, false)
+                .map(|h| h.size()),
+            Some(33)
+        );
+    }
+
+    #[test]
+    fn off_never_looks_and_captures_is_what_lets_a_capture_look() {
+        let mut c = MetaCache::default();
+        c.insert(&[1, 2, 3, 4], handle(11));
+        assert!(c.get(&[1, 2, 3, 4], MetaCacheMode::Off, false).is_none());
+        assert!(c.get(&[1, 2, 3, 4], MetaCacheMode::Eager, true).is_none());
+        assert!(
+            c.get(&[1, 2, 3, 4], MetaCacheMode::Captures, true)
+                .is_some()
+        );
+    }
+
+    /// An entry handed out inside a capture has its ADDRESS in a graph node,
+    /// so eviction may not take it however old it is.
+    #[test]
+    fn eviction_bounds_the_map_and_spares_what_a_graph_points_at() {
+        let cap = super::capacity();
+        let mut c = MetaCache::default();
+        // The oldest entry, pinned by a capture, and one more that is not.
+        c.insert(&[0, 0, 0, 1], handle(1));
+        let _ = c.get(&[0, 0, 0, 1], MetaCacheMode::Captures, true);
+        c.insert(&[0, 0, 0, 2], handle(2));
+        for i in 0..(cap as u32 + 64) {
+            c.insert(&i.to_le_bytes(), handle(100 + i as u64));
+        }
+        assert!(
+            c.entries.len() <= cap,
+            "the map grew past its bound: {} > {cap}",
+            c.entries.len()
+        );
+        assert!(
+            c.get(&[0, 0, 0, 1], MetaCacheMode::Captures, true)
+                .is_some(),
+            "a pinned entry was evicted, and a graph node still names its buffer"
+        );
     }
 }
