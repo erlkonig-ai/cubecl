@@ -6,6 +6,7 @@ use crate::{
         command::Command,
         communication::{external_comm, get_nccl_comm_id, get_nccl_dtype_count, to_nccl_op},
         context::CudaContext,
+        meta_cache::MetaCacheMode,
         stream::CudaStreamBackend,
         sync::Fence,
     },
@@ -464,7 +465,13 @@ impl ComputeServer for CudaServer {
                  recent capture did, so the two are not captures of the same region -- and \
                  they share the arena's slices. Replaying this one now would compute on \
                  scratch the other holds live, and would emit a PLAUSIBLE answer rather \
-                 than fail. Give a second region its own arena."
+                 than fail. Give a second region its own arena. ONE OTHER WAY TO GET HERE, \
+                 and it is not a different region: under CUBECL_META_CACHE=2 a metadata \
+                 cache HIT is one fewer request the capture makes of the arena, so a region \
+                 re-captured after eager steps warmed the cache further signs differently \
+                 from its first capture. The refusal is still correct -- the two really did \
+                 take different slices -- but the cause is the cache, and CUBECL_META_CACHE=1 \
+                 keeps it out of captured regions."
             );
         }
         self.unsafe_set_current();
@@ -572,8 +579,15 @@ impl ComputeServer for CudaServer {
                          tensor's shape or stride changed -- and no staging buffer to write it \
                          into. Its memcpy node would keep uploading the captured step's shapes, \
                          and the replay would compute a plausible wrong answer rather than fail. \
-                         The launch was captured with CUBECL_GRAPH_STAGE_OWN=0, which is the arm \
-                         that hands staging back to the pool."
+                         TWO WAYS A LAUNCH ARRIVES HERE WITHOUT STAGING. It was captured with \
+                         CUBECL_GRAPH_STAGE_OWN=0, the arm that hands staging back to the pool; \
+                         or it was captured under CUBECL_META_CACHE=2 and HIT the metadata \
+                         cache, so it performed no upload at all and has no node to rewrite. \
+                         The second is not a gap to be filled: the buffer a hit bound is shared \
+                         with every other launch describing the same shapes, so writing this \
+                         patch into it would silently change theirs. A launch whose shapes move \
+                         needs its own upload -- capture it with CUBECL_META_CACHE=1, which \
+                         leaves captured regions alone entirely."
                     )
                 });
                 let dst = g.staging.get_mut(slot).unwrap_or_else(|| {
@@ -1494,13 +1508,72 @@ impl CudaServer {
             true => command.streams.current().capture_staging.len(),
             false => 0,
         };
+        let meta_mode = MetaCacheMode::current();
         let (info_const, info_binding) = if grid_constants {
             let info = &bindings.info;
 
             let mut handle = Option::None;
             if info.dynamic_metadata_offset < info.data.len() {
-                let dyn_meta = &bytemuck::cast_slice(&info.data[info.dynamic_metadata_offset..]);
-                handle = Some(command.create_with_data(dyn_meta)?);
+                let dyn_meta: &[u8] =
+                    bytemuck::cast_slice(&info.data[info.dynamic_metadata_offset..]);
+                // THE DYNAMIC HALF, which this launch is about to describe
+                // again. It is every bound tensor's shape and stride list, and
+                // building it costs a pinned reserve, a host memcpy, a device
+                // allocation and a `cuMemcpyHtoDAsync` -- on every launch
+                // binding a ranked tensor, every time, whether or not a single
+                // shape moved. A decode step of `mary`'s inkling path does that
+                // 483 times for 19,280 bytes, and on 127 steps out of every 128
+                // every one of those copies the same bytes it copied last step.
+                //
+                // So ask first whether some device buffer already holds exactly
+                // these bytes. `MetaCache::get` verifies the full payload on a
+                // hash match, so a hit is an identity and not a guess; see
+                // `compute::meta_cache` for why it is keyed this way, why it is
+                // per stream, and what it does and does not do inside a
+                // capture. Off unless `CUBECL_META_CACHE` says otherwise, in
+                // which case this is one `None` and today's path exactly.
+                // Guarded rather than left to `get`'s own early return, so
+                // that with the cache off this launch does not even resolve
+                // the stream: OFF has to be today's path exactly, including
+                // what it costs.
+                let cached = match meta_mode.enabled() {
+                    true => command
+                        .streams
+                        .current()
+                        .meta_cache
+                        .get(dyn_meta, meta_mode, capture_open),
+                    false => None,
+                };
+                handle = Some(match cached {
+                    Some(hit) => hit,
+                    None => {
+                        let fresh = command.create_with_data(dyn_meta)?;
+                        // WHAT MAY BE REMEMBERED, and the two things that rule
+                        // a buffer out. Inside a capture the copy that fills
+                        // this buffer has not run -- it is a graph node, and it
+                        // runs on a replay -- so a later eager launch binding
+                        // it would read whatever the allocator last left there.
+                        // And a slice served from the capture arena is
+                        // capture-scoped scratch, re-matched by size on every
+                        // reopening, which an entry that outlives the region
+                        // must not be. Either way the launch keeps today's
+                        // behaviour and the cache simply does not grow.
+                        let eager = !capture_open
+                            && !command
+                                .streams
+                                .current()
+                                .memory_management_gpu
+                                .arena_active();
+                        if meta_mode.enabled() && eager {
+                            command
+                                .streams
+                                .current()
+                                .meta_cache
+                                .insert(dyn_meta, fresh.clone());
+                        }
+                        fresh
+                    }
+                });
             }
 
             (Some(info.data.as_ptr() as *mut c_void), handle)

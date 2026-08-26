@@ -1,4 +1,5 @@
 use crate::compute::{
+    meta_cache::MetaCache,
     storage::{
         cpu::{PINNED_MEMORY_ALIGNMENT, PinnedMemoryStorage},
         gpu::GpuStorage,
@@ -41,6 +42,18 @@ pub struct Stream {
     /// and the node holds the buffer's ADDRESS. So the capture takes ownership
     /// instead, and `graph_capture_end` moves these into the graph.
     pub capture_staging: Vec<cubecl_common::bytes::Bytes>,
+    /// Device buffers already holding a launch's shape-and-stride list, so a
+    /// launch that describes the same shapes as an earlier one need not build
+    /// the buffer again.
+    ///
+    /// Per stream because a device buffer is: a `Handle` carries the
+    /// `StreamId` it was created on, and every consumer of one resolves the
+    /// memory through that stream's own manager. A cache shared between
+    /// streams would hand a launch a handle its stream cannot resolve.
+    ///
+    /// Empty and untouched unless `CUBECL_META_CACHE` says otherwise; see
+    /// [`crate::compute::meta_cache`].
+    pub meta_cache: MetaCache,
 }
 
 impl drop_queue::Fence for Fence {
@@ -96,6 +109,7 @@ impl EventStreamBackend for CudaStreamBackend {
             errors: Vec::new(),
             drop_queue: Default::default(),
             capture_staging: Vec::new(),
+            meta_cache: MetaCache::default(),
         }
     }
 
