@@ -104,3 +104,66 @@ pub(crate) fn get_nccl_dtype_count(
         ElemType::Bool => panic!("NCCL doesn't support Bool format."),
     }
 }
+
+// ---------------------------------------------------------------------------
+// An externally bootstrapped communicator, for the multi-PROCESS case.
+// ---------------------------------------------------------------------------
+//
+// [`get_nccl_comm_id`] mints a unique id and remembers it in a process-global
+// map. That is exactly right for one process driving several GPUs — every
+// participant reads the same map — and it is unusable across two processes on
+// two nodes, in two independent ways:
+//
+//  1. Each process mints its OWN id, so `ncclCommInitRank` never pairs them.
+//     The failure is a HANG in the rendezvous rather than an error, which is
+//     the worst shape for it to take.
+//  2. The rank is derived as this device's position in the sorted device list.
+//     Two boxes each holding their local CUDA device 0 both derive rank 0, so
+//     even a shared id would produce two rank-0s and no rank 1.
+//
+// Both are properties of how the group was FORMED, and a process that spans
+// nodes already has to form it itself: one rank mints the id and ships the 128
+// bytes to the others over whatever channel it already has. This is the seam
+// where it hands the result back. Set it before the first collective and the
+// derivation above is bypassed whole; leave it unset and nothing here changes.
+
+/// A communicator bootstrapped outside this process: the shared id, and who
+/// this process is inside the group.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalComm {
+    /// The unique id one rank minted and every rank received.
+    pub id: cudarc::nccl::sys::ncclUniqueId,
+    /// This process's rank, `0..world`.
+    pub rank: i32,
+    /// How many ranks are in the group.
+    pub world: i32,
+}
+
+static EXTERNAL_COMM: OnceLock<Mutex<Option<ExternalComm>>> = OnceLock::new();
+
+/// Mint a unique id, as plain bytes to send over a socket.
+///
+/// Bytes rather than `ncclUniqueId` because the caller's job is to TRANSPORT
+/// this, and because `c_char` is signed on x86_64 and unsigned on aarch64 —
+/// these two boxes are aarch64, but a type whose signedness depends on the
+/// target has no business in a wire format. The round trip through
+/// [`set_external_comm`] is bit-exact either way.
+pub fn mint_unique_id() -> Result<[u8; 128], String> {
+    let id = cudarc::nccl::result::get_uniqueid()
+        .map_err(|e| format!("ncclGetUniqueId failed: {e:?}"))?;
+    Ok(id.internal.map(|c| c as u8))
+}
+
+/// Install the group this process belongs to, overriding the single-process
+/// derivation for every collective from here on.
+pub fn set_external_comm(id: [u8; 128], rank: i32, world: i32) {
+    let id = cudarc::nccl::sys::ncclUniqueId {
+        internal: id.map(|b| b as core::ffi::c_char),
+    };
+    *EXTERNAL_COMM.get_or_init(Default::default).lock().unwrap() =
+        Some(ExternalComm { id, rank, world });
+}
+
+pub(crate) fn external_comm() -> Option<ExternalComm> {
+    *EXTERNAL_COMM.get_or_init(Default::default).lock().unwrap()
+}
