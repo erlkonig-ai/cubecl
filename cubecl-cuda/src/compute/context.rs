@@ -325,6 +325,26 @@ impl CudaContext {
         Ok(())
     }
 
+    /// The module-side half of a kernel's launch parameters: the function
+    /// handle, the cube dim and the dynamic shared memory size.
+    ///
+    /// A captured graph node holds these alongside the caller's bindings, and
+    /// rewriting the node later has to hand all of them back -- CUDA has no
+    /// "change only the arguments" call. They come from the loaded module
+    /// rather than from the launch, so this is where they are reachable.
+    pub fn kernel_launch_shape(
+        &self,
+        kernel_id: &KernelId,
+    ) -> Option<(*mut CUfunc_st, (u32, u32, u32), u32)> {
+        self.module_names.get(kernel_id).map(|k| {
+            (
+                k.func,
+                (k.cube_dim.x, k.cube_dim.y, k.cube_dim.z),
+                k.shared_mem_bytes as u32,
+            )
+        })
+    }
+
     fn validate_shared(&self, repr: &Option<CudaComputeKernel>) -> Result<(), LaunchError> {
         let requested = repr.as_ref().map(|repr| repr.shared_memory_size());
         let max = self.properties.hardware.max_shared_memory_size;

@@ -394,6 +394,43 @@ where
         panic!("graph capture is not supported by this backend");
     }
 
+    /// How many kernel launches the OPEN capture has recorded so far.
+    ///
+    /// This is the index a caller brackets its own calls with, so that after
+    /// the capture closes it can name the nodes a particular call produced
+    /// without knowing anything about how many kernels that call fans out to.
+    /// It counts launches, not nodes: a launch is one node, but a graph also
+    /// holds memcpy and memset nodes that no launch made.
+    fn graph_capture_launch_count(&mut self) -> usize {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// How many launches the closed graph `id` recorded.
+    fn graph_launch_count(&mut self, _id: u64) -> usize {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// What launch `idx` of graph `id` was recorded WITH: its grid, its packed
+    /// scalar+metadata blob, and the device address of every buffer it bound.
+    ///
+    /// This is the half of patching that makes it checkable. A caller that
+    /// wants to move a scalar has to know which slot of the blob holds it, and
+    /// the honest way to learn that is to look at what the blob actually
+    /// contained when the value was known -- not to re-derive cubecl's packing
+    /// order by hand and hope.
+    fn graph_launch_params(&mut self, _id: u64, _idx: usize) -> GraphLaunchParams {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Rewrite launch `idx` of graph `id`'s EXECUTABLE in place.
+    ///
+    /// The graph is untouched; only the instantiated exec changes, which is
+    /// what makes this cheap enough to do per step. Everything not named in
+    /// `patch` keeps the value it was captured with.
+    fn graph_patch_launch(&mut self, _id: u64, _idx: usize, _patch: GraphLaunchPatch) {
+        panic!("graph capture is not supported by this backend");
+    }
+
     /// Release a captured graph. An unknown id is ignored.
     fn graph_destroy(&mut self, _id: u64) {}
 
@@ -1227,4 +1264,45 @@ mod tests {
         let expected = [25, 32, 4];
         assert_eq!(actual, expected);
     }
+}
+
+/// What one captured launch was recorded with.
+///
+/// `info` is cubecl's packed argument blob -- scalars first, sorted by type,
+/// then static metadata, then dynamic metadata -- exactly as the launch
+/// presented it. `ptrs` are the device addresses the launch bound, in binding
+/// order. Both are the values baked into the graph node, which is why reading
+/// them back is the only sound way to locate a value inside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphLaunchParams {
+    /// The cube count the launch was recorded with.
+    pub grid: (u32, u32, u32),
+    /// The cube dim the launch was recorded with.
+    pub block: (u32, u32, u32),
+    /// The packed scalar and metadata blob, as captured.
+    pub info: Vec<u64>,
+    /// Whether `info` reached the kernel as a by-value grid constant. When it
+    /// did not, it lives in a device buffer instead and no parameter rewrite
+    /// can move it.
+    pub info_is_grid_constant: bool,
+    /// The device address of every buffer the launch bound, in binding order.
+    pub ptrs: Vec<u64>,
+}
+
+/// What to change about one captured launch. Fields left `None`/empty keep the
+/// captured value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphLaunchPatch {
+    /// A new cube count. This is what moves a launch whose GEOMETRY depends on
+    /// a per-step quantity, such as an attention split count that grows with
+    /// the context.
+    pub grid: Option<(u32, u32, u32)>,
+    /// A new packed argument blob. Must be the same length as the captured
+    /// one: the kernel's parameter size is fixed at compile time and a shorter
+    /// blob would have the driver read past it.
+    pub info: Option<Vec<u64>>,
+    /// `(binding index, new device address)` for buffers that must be
+    /// re-pointed. Empty is the normal case and the one the design is for --
+    /// a region whose buffers are pinned patches scalars only.
+    pub ptrs: Vec<(usize, u64)>,
 }

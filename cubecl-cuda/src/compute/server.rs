@@ -20,9 +20,10 @@ use cubecl_core::{
     ir::{ElemType, FloatKind, IntKind, MemoryDeviceProperties, StorageType, UIntKind},
     prelude::*,
     server::{
-        Binding, CommunicationId, CopyDescriptor, Handle, KernelArguments, LaunchError,
-        ProfileError, ProfilingToken, ReduceOperation, ServerCommunication, ServerError,
-        ServerUtilities, StreamErrorMode, TensorMapBinding, TensorMapMeta,
+        Binding, CommunicationId, CopyDescriptor, GraphLaunchParams, GraphLaunchPatch, Handle,
+        KernelArguments, LaunchError, ProfileError, ProfilingToken, ReduceOperation,
+        ServerCommunication, ServerError, ServerUtilities, StreamErrorMode, TensorMapBinding,
+        TensorMapMeta,
     },
 };
 use cubecl_runtime::{
@@ -65,6 +66,35 @@ pub struct CudaServer {
     /// [`CapturedGraph`] at `graph_capture_end`. See `CapturedGraph::hold` for
     /// why holding them is a correctness requirement and not caution.
     capture_hold: Vec<Binding>,
+    /// Every kernel launch made while a capture is open, in launch order, moved
+    /// into the [`CapturedGraph`] at `graph_capture_end`. This is the index a
+    /// later parameter rewrite names its node by.
+    capture_launches: Vec<CapturedLaunch>,
+}
+
+/// One launch a capture recorded, with everything needed to rewrite it.
+///
+/// CUDA has no "change only this argument" call: `cuGraphExecKernelNodeSetParams`
+/// takes a WHOLE `CUDA_KERNEL_NODE_PARAMS`, so a node that is to be patched has
+/// to be reconstructible from what is stored here alone. That is why the
+/// pointers and the packed blob are owned copies rather than the caller's
+/// buffers -- the caller's are gone by the time a patch happens.
+///
+/// The argument order mirrors the launch exactly: the tensor map structs, then
+/// one pointer per bound resource (the tensor maps' own buffers first, then the
+/// ordinary buffers, then the metadata buffer if there is one), then the packed
+/// blob if it rides as a by-value grid constant.
+#[derive(Debug)]
+struct CapturedLaunch {
+    node: cudarc::driver::sys::CUgraphNode,
+    func: cudarc::driver::sys::CUfunction,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    shared: u32,
+    tensor_maps: Vec<cudarc::driver::sys::CUtensorMap>,
+    ptrs: Vec<u64>,
+    info: Vec<u64>,
+    info_is_grid_constant: bool,
 }
 
 /// Whether a capture holds the buffers its nodes point at. On, always, in any
@@ -91,6 +121,7 @@ struct CapturedGraph {
     graph: cudarc::driver::sys::CUgraph,
     exec: cudarc::driver::sys::CUgraphExec,
     hold: Vec<Binding>,
+    launches: Vec<CapturedLaunch>,
 }
 
 // SAFETY: `CudaServer` is only accessed from one thread at a time via the `DeviceHandle`,
@@ -205,6 +236,7 @@ impl ComputeServer for CudaServer {
         let stream = self.raw_stream(stream_id, Some(true));
         crate::compute::CAPTURE_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
         self.capture_hold.clear();
+        self.capture_launches.clear();
         unsafe { cudarc::driver::result::stream::begin_capture(stream, mode) }
             .expect("stream capture to begin");
     }
@@ -249,7 +281,16 @@ impl ComputeServer for CudaServer {
         let id = self.next_graph_id;
         self.next_graph_id += 1;
         let hold = core::mem::take(&mut self.capture_hold);
-        self.graphs.insert(id, CapturedGraph { graph, exec, hold });
+        let launches = core::mem::take(&mut self.capture_launches);
+        self.graphs.insert(
+            id,
+            CapturedGraph {
+                graph,
+                exec,
+                hold,
+                launches,
+            },
+        );
         id
     }
 
@@ -288,6 +329,121 @@ impl ComputeServer for CudaServer {
                 .expect("the graph to report its node count");
         }
         n
+    }
+
+    fn graph_capture_launch_count(&mut self) -> usize {
+        self.capture_launches.len()
+    }
+
+    fn graph_launch_count(&mut self, id: u64) -> usize {
+        self.captured(id).launches.len()
+    }
+
+    fn graph_launch_params(&mut self, id: u64, idx: usize) -> GraphLaunchParams {
+        let launches = &self.captured(id).launches;
+        let l = launches.get(idx).unwrap_or_else(|| {
+            panic!(
+                "graph {id} recorded {} launches, so there is no launch {idx}",
+                launches.len()
+            )
+        });
+        GraphLaunchParams {
+            grid: l.grid,
+            block: l.block,
+            info: l.info.clone(),
+            info_is_grid_constant: l.info_is_grid_constant,
+            ptrs: l.ptrs.clone(),
+        }
+    }
+
+    /// Rewrite one launch of an instantiated graph.
+    ///
+    /// The GRAPH is not touched, only the exec, which is what makes this worth
+    /// doing per step: re-capturing the region would cost exactly the host time
+    /// the region exists to remove.
+    fn graph_patch_launch(&mut self, id: u64, idx: usize, patch: GraphLaunchPatch) {
+        self.unsafe_set_current();
+        let g = self
+            .graphs
+            .get_mut(&id)
+            .unwrap_or_else(|| panic!("no captured graph with id {id}"));
+        let exec = g.exec;
+        let n = g.launches.len();
+        let l = g
+            .launches
+            .get_mut(idx)
+            .unwrap_or_else(|| panic!("graph {id} recorded {n} launches, so there is no launch {idx}"));
+
+        if let Some(grid) = patch.grid {
+            l.grid = grid;
+        }
+        if let Some(info) = patch.info {
+            assert!(
+                l.info_is_grid_constant,
+                "launch {idx} of graph {id} passes its scalars in a DEVICE BUFFER, not as a                  by-value grid constant, so no parameter rewrite can move them -- the value                  would have to be written to the buffer instead, and the buffer is shared"
+            );
+            assert_eq!(
+                info.len(),
+                l.info.len(),
+                "the packed argument blob is a fixed-size kernel parameter: launch {idx} of                  graph {id} was captured with {} words and the patch offers {}",
+                l.info.len(),
+                info.len()
+            );
+            l.info = info;
+        }
+        for (i, ptr) in patch.ptrs {
+            assert!(
+                i < l.ptrs.len(),
+                "launch {idx} of graph {id} bound {} buffers, so there is no binding {i}",
+                l.ptrs.len()
+            );
+            l.ptrs[i] = ptr;
+        }
+
+        // The argument array, rebuilt in the same order the launch presented
+        // it: tensor map structs, then one pointer per bound resource, then the
+        // packed blob when it rides as a grid constant. Every element points
+        // into `l`, which outlives this call.
+        let mut params: Vec<*mut c_void> =
+            Vec::with_capacity(l.tensor_maps.len() + l.ptrs.len() + 1);
+        for m in l.tensor_maps.iter() {
+            params.push(m as *const _ as *mut c_void);
+        }
+        for ptr in l.ptrs.iter() {
+            params.push(ptr as *const u64 as *mut c_void);
+        }
+        if l.info_is_grid_constant && !l.info.is_empty() {
+            params.push(l.info.as_ptr() as *mut c_void);
+        }
+
+        // Zeroed rather than braced, because the struct grew `kern` and `ctx`
+        // fields in CUDA 12 and this has to build against both shapes. Zero is
+        // the documented "use `func`" value for them.
+        let mut np: cudarc::driver::sys::CUDA_KERNEL_NODE_PARAMS =
+            unsafe { core::mem::zeroed() };
+        np.func = l.func;
+        np.gridDimX = l.grid.0;
+        np.gridDimY = l.grid.1;
+        np.gridDimZ = l.grid.2;
+        np.blockDimX = l.block.0;
+        np.blockDimY = l.block.1;
+        np.blockDimZ = l.block.2;
+        np.sharedMemBytes = l.shared;
+        np.kernelParams = params.as_mut_ptr();
+        np.extra = core::ptr::null_mut();
+
+        // SAFETY: `exec` is a live instantiated graph and `l.node` one of its
+        // nodes; `np` names the same function, the same shared memory size and
+        // the same number of parameters the node was captured with, which is
+        // what `cuGraphExecKernelNodeSetParams` requires. Every parameter
+        // pointer targets storage owned by `l` and outliving the call.
+        unsafe {
+            cudarc::driver::sys::cuGraphExecKernelNodeSetParams_v2(exec, l.node, &np)
+                .result()
+                .unwrap_or_else(|err| {
+                    panic!("launch {idx} of graph {id} refused the parameter rewrite: {err:?}")
+                });
+        }
     }
 
     fn graph_destroy(&mut self, id: u64) {
@@ -790,6 +946,7 @@ impl CudaServer {
             communicators: HashMap::default(),
             graphs: HashMap::default(),
             next_graph_id: 1,
+            capture_launches: Vec::new(),
             capture_hold: Vec::new(),
         }
     }
@@ -951,8 +1108,15 @@ impl CudaServer {
         // so none of them may go back to the allocator. Collected into a local
         // because `command` holds the server borrow until it is dropped.
         let mut hold_now: Vec<Binding> = Vec::new();
-        let capturing = crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed)
-            && capture_hold_enabled();
+        let capture_open = crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed);
+        // The packed scalar+metadata blob, copied while it is still the
+        // caller's. A node holds the BYTES, so a later rewrite has to be able
+        // to reproduce them, and by then this vector is gone.
+        let info_snapshot = match capture_open {
+            true => Some(bindings.info.data.clone()),
+            false => None,
+        };
+        let capturing = capture_open && capture_hold_enabled();
         if capturing {
             hold_now.extend(bindings.tensor_maps.iter().map(|it| it.binding.clone()));
             hold_now.extend(bindings.buffers.iter().cloned());
@@ -1138,7 +1302,7 @@ impl CudaServer {
                 .map(|s| command.resource(s.binding()).expect("Resource to exist")),
         );
 
-        command.kernel(
+        let captured = command.kernel(
             kernel_id,
             kernel,
             mode,
@@ -1150,8 +1314,28 @@ impl CudaServer {
         )?;
         core::mem::drop(command);
         self.capture_hold.append(&mut hold_now);
+        if let Some(node) = captured {
+            self.capture_launches.push(CapturedLaunch {
+                node: node.node,
+                func: node.func,
+                grid: count,
+                block: node.block,
+                shared: node.shared,
+                tensor_maps: tensor_maps.clone(),
+                ptrs: resources.iter().map(|r| r.ptr).collect(),
+                info: info_snapshot.unwrap_or_default(),
+                info_is_grid_constant: grid_constants,
+            });
+        }
 
         Ok(())
+    }
+
+    /// The graph named by `id`, or a panic that says which id was asked for.
+    fn captured(&self, id: u64) -> &CapturedGraph {
+        self.graphs
+            .get(&id)
+            .unwrap_or_else(|| panic!("no captured graph with id {id}"))
     }
 
     pub(crate) fn utilities(&self) -> Arc<ServerUtilities<Self>> {

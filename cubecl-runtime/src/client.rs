@@ -5,7 +5,8 @@ use crate::{
     memory_management::{MemoryAllocationMode, MemoryUsage},
     runtime::Runtime,
     server::{
-        CommunicationId, ComputeServer, CopyDescriptor, CubeCount, ExecutionMode, Handle, IoError,
+        CommunicationId, ComputeServer, CopyDescriptor, CubeCount, ExecutionMode,
+        GraphLaunchParams, GraphLaunchPatch, Handle, IoError,
         KernelArguments, MemoryLayout, MemoryLayoutDescriptor, MemoryLayoutPolicy,
         MemoryLayoutStrategy, ProfileError, ReduceOperation, ServerCommunication, ServerError,
         ServerUtilities,
@@ -534,6 +535,40 @@ impl<R: Runtime> ComputeClient<R> {
     pub fn graph_node_count(&self, id: u64) -> usize {
         self.device
             .submit_blocking(move |server| server.graph_node_count(id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_capture_launch_count`].
+    pub fn graph_capture_launch_count(&self) -> usize {
+        self.device
+            .submit_blocking(move |server| server.graph_capture_launch_count())
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_launch_count`].
+    pub fn graph_launch_count(&self, id: u64) -> usize {
+        self.device
+            .submit_blocking(move |server| server.graph_launch_count(id))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_launch_params`].
+    pub fn graph_launch_params(&self, id: u64, idx: usize) -> GraphLaunchParams {
+        self.device
+            .submit_blocking(move |server| server.graph_launch_params(id, idx))
+            .unwrap()
+    }
+
+    /// See [`ComputeServer::graph_patch_launch`].
+    ///
+    /// Blocking, unlike [`Self::graph_replay`]. A patch must be ORDERED before
+    /// the replay that is supposed to see it, and the two go through the same
+    /// device queue, so fire-and-forget would be correct as well -- but a
+    /// patch that names a bad index has to say so at the call site rather than
+    /// on some later unrelated submit.
+    pub fn graph_patch_launch(&self, id: u64, idx: usize, patch: GraphLaunchPatch) {
+        self.device
+            .submit_blocking(move |server| server.graph_patch_launch(id, idx, patch))
             .unwrap()
     }
 

@@ -512,7 +512,7 @@ impl<'a> Command<'a> {
         resources: &[GpuResource],
         const_info: Option<*mut c_void>,
         logger: Arc<ServerLogger>,
-    ) -> Result<(), LaunchError> {
+    ) -> Result<Option<CapturedNode>, LaunchError> {
         if !self.ctx.module_names.contains_key(&kernel_id) {
             self.ctx.compile_kernel(&kernel_id, kernel, mode, logger)?;
         }
@@ -534,6 +534,13 @@ impl<'a> Command<'a> {
             eprintln!("{line}");
         }
 
+        // Looked up BEFORE the launch, because `execute_task` consumes the id
+        // and because a lookup is the whole cost -- there is nothing to gain by
+        // doing it after and a moved value to work around.
+        let capture_shape = match stream.capturing {
+            true => self.ctx.kernel_launch_shape(&kernel_id),
+            false => None,
+        };
         let result = self.ctx.execute_task(
             stream,
             kernel_id,
@@ -558,8 +565,90 @@ impl<'a> Command<'a> {
                 false => self.ctx.timestamps.error(ProfileError::Launch(err)),
             }
         };
-        Ok(())
+
+        // The node this launch just became, while the capture still knows.
+        //
+        // A capture's FRONTIER -- the dependency set a subsequent launch would
+        // hang off -- is, immediately after a launch on a linear single-stream
+        // capture, exactly the one node that launch added. That is the only
+        // moment the mapping from "the Nth launch of this region" to "this
+        // CUgraphNode" is available at all: `cuGraphGetNodes` afterwards
+        // returns the graph's nodes in NO defined order, and a graph holds
+        // memcpy and memset nodes that no launch made, so there is nothing to
+        // index by. The `assert` is not caution; it is the statement that the
+        // capture is linear, which is what makes the index meaningful.
+        let captured = if stream.capturing {
+            use cudarc::driver::sys::{
+                CUgraph, CUgraphEdgeData, CUgraphNode, CUstreamCaptureStatus,
+                cuStreamGetCaptureInfo_v3,
+            };
+            let mut status = CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+            let mut cap_id: u64 = 0;
+            let mut graph: CUgraph = core::ptr::null_mut();
+            let mut deps: *const CUgraphNode = core::ptr::null();
+            let mut edges: *const CUgraphEdgeData = core::ptr::null();
+            let mut n_deps: usize = 0;
+            // SAFETY: `stream.sys` is a live stream with a capture open on it;
+            // every out-parameter is a live local. The returned `deps` array is
+            // owned by the driver and read before any further capture call.
+            unsafe {
+                cuStreamGetCaptureInfo_v3(
+                    stream.sys,
+                    &mut status,
+                    &mut cap_id,
+                    &mut graph,
+                    &mut deps,
+                    &mut edges,
+                    &mut n_deps,
+                )
+                .result()
+                .map_err(|err| LaunchError::Unknown {
+                    reason: format!("the open capture would not report its frontier: {err:?}"),
+                    backtrace: BackTrace::capture(),
+                })?;
+            }
+            if status == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE && !deps.is_null() {
+                assert_eq!(
+                    n_deps, 1,
+                    "a capture that forks has no launch order to index by:                      the frontier after one launch held {n_deps} nodes, not 1"
+                );
+                let (func, block, shared) =
+                    capture_shape.expect("the kernel that just launched to be a loaded module");
+                // SAFETY: `deps` points at `n_deps == 1` driver-owned nodes.
+                Some(CapturedNode {
+                    node: unsafe { *deps },
+                    func,
+                    block,
+                    shared,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(captured)
     }
+}
+
+/// One kernel launch that a graph capture recorded, named by the node it
+/// became plus the parts of its parameters that come from the loaded module
+/// rather than from the caller's bindings.
+///
+/// It is deliberately not the whole parameter set: the buffers, the cube count
+/// and the packed argument blob are the caller's, and the caller is where they
+/// stay owned.
+#[derive(Debug, Clone, Copy)]
+pub struct CapturedNode {
+    /// The graph node this launch produced.
+    pub node: cudarc::driver::sys::CUgraphNode,
+    /// The function the node calls.
+    pub func: cudarc::driver::sys::CUfunction,
+    /// The cube dim it was launched with.
+    pub block: (u32, u32, u32),
+    /// Its dynamic shared memory size, in bytes.
+    pub shared: u32,
 }
 
 /// Internal write to GPU command.
