@@ -13,10 +13,38 @@ pub struct FlushingPolicy {
     pub max_bytes_size: u32,
 }
 
+/// The staged-allocation count a flush triggers at, overridable at runtime.
+///
+/// WHY THIS IS A KNOB AND WHAT IT MEASURES. A flush waits on the fence from the
+/// PREVIOUS flush cycle, so it blocks the launching thread until the device has
+/// drained to a point one batch back. That wait needs no VALUE from the device
+/// -- it exists only so staging buffers two batches old can be freed -- which
+/// makes it queue-depth SERIALISATION rather than a data dependency, and
+/// therefore recoverable. The two are indistinguishable in a profile: both are
+/// `cuEventSynchronize` on the launching thread.
+///
+/// The default of 64 was chosen against uploads of ordinary size. A decode step
+/// of this model stages roughly 483 of them -- one per launch that binds a
+/// ranked tensor, each carrying that tensor's shape and stride list, 19280
+/// bytes for the whole step -- so the count threshold fires about seven times a
+/// step while the 64 MiB size threshold never fires at all. Raising the count
+/// is the A/B that says how much of the blocked time is serialisation, in one
+/// binary and one flag, and it costs only that many small pinned buffers held
+/// one cycle longer.
+fn flush_count_default() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CUBECL_DROP_FLUSH_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+    })
+}
+
 impl Default for FlushingPolicy {
     fn default() -> Self {
         Self {
-            max_bytes_count: 64,
+            max_bytes_count: flush_count_default(),
             max_bytes_size: 64 * 1024 * 1024, // 64 MiB
         }
     }
