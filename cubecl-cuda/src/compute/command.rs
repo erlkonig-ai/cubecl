@@ -47,6 +47,13 @@ const PINNED_STAGING_MAX: usize = 128 * 1024 * 1024;
 /// Whether to use it at all. Default OFF: on GB10 the pinned pool measured
 /// SLOWER than the pageable path it replaces (see `inkling_expert_probe`), and
 /// a switch keeps both lanes runnable from one binary instead of one build.
+/// Whether to print every launch's bound device addresses. Read once: a
+/// `getenv` per kernel launch would be a cost on the path this exists to study.
+fn trace_ptrs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_TRACE_PTRS").as_deref() == Ok("1"))
+}
+
 fn pinned_staging_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -511,6 +518,21 @@ impl<'a> Command<'a> {
         }
 
         let stream = self.streams.current();
+
+        // `CUBECL_TRACE_PTRS=1`: the device ADDRESS of every buffer each launch
+        // binds. A captured graph records addresses, so whether a region is
+        // replayable on a LATER step is first of all a question about whether
+        // the allocator hands the same slices out again -- and that is a
+        // question with an answer you can diff, not one to reason about.
+        if trace_ptrs() {
+            use core::fmt::Write as _;
+            let mut line = alloc::string::String::new();
+            let _ = write!(line, "[ptr] {kernel_id:?}");
+            for r in resources {
+                let _ = write!(line, " {:#x}", r.ptr as usize);
+            }
+            eprintln!("{line}");
+        }
 
         let result = self.ctx.execute_task(
             stream,

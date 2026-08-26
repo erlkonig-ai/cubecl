@@ -61,13 +61,36 @@ pub struct CudaServer {
     /// server, because a CUgraph is not internally synchronized.
     graphs: HashMap<u64, CapturedGraph>,
     next_graph_id: u64,
+    /// Every buffer bound to a launch while a capture is open, moved into the
+    /// [`CapturedGraph`] at `graph_capture_end`. See `CapturedGraph::hold` for
+    /// why holding them is a correctness requirement and not caution.
+    capture_hold: Vec<Binding>,
 }
 
-/// One captured region: the graph and the executable instantiated from it.
+/// Whether a capture holds the buffers its nodes point at. On, always, in any
+/// run whose answer matters -- `CUBECL_GRAPH_HOLD=0` is the arm that shows what
+/// it is worth, and what it costs, in one binary.
+fn capture_hold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_GRAPH_HOLD").as_deref() != Ok("0"))
+}
+
+/// One captured region: the graph, the executable instantiated from it, and
+/// every buffer its nodes hold a pointer to.
+///
+/// `hold` is not bookkeeping. A graph records device ADDRESSES, so a slice any
+/// node reads or writes must stay allocated -- and, just as importantly, must
+/// not be handed to anything else -- for as long as the graph can be replayed.
+/// Without it the allocator recycles a buffer that dies inside the region into
+/// a later node of the SAME region, and the second replay reads what the first
+/// replay wrote over its own input. The first replay does not show it, because
+/// the first replay still finds the pre-region value there; what shows is the
+/// step after, reading state the region was supposed to have carried.
 #[derive(Debug)]
 struct CapturedGraph {
     graph: cudarc::driver::sys::CUgraph,
     exec: cudarc::driver::sys::CUgraphExec,
+    hold: Vec<Binding>,
 }
 
 // SAFETY: `CudaServer` is only accessed from one thread at a time via the `DeviceHandle`,
@@ -181,6 +204,7 @@ impl ComputeServer for CudaServer {
         self.unsafe_set_current();
         let stream = self.raw_stream(stream_id, Some(true));
         crate::compute::CAPTURE_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
+        self.capture_hold.clear();
         unsafe { cudarc::driver::result::stream::begin_capture(stream, mode) }
             .expect("stream capture to begin");
     }
@@ -224,7 +248,8 @@ impl ComputeServer for CudaServer {
             .expect("the graph to upload");
         let id = self.next_graph_id;
         self.next_graph_id += 1;
-        self.graphs.insert(id, CapturedGraph { graph, exec });
+        let hold = core::mem::take(&mut self.capture_hold);
+        self.graphs.insert(id, CapturedGraph { graph, exec, hold });
         id
     }
 
@@ -765,6 +790,7 @@ impl CudaServer {
             communicators: HashMap::default(),
             graphs: HashMap::default(),
             next_graph_id: 1,
+            capture_hold: Vec::new(),
         }
     }
 
@@ -919,6 +945,24 @@ impl CudaServer {
             }
             (None, handle)
         };
+
+        // While a capture is open every buffer this launch binds becomes a
+        // POINTER inside a graph node and stays one for the graph's whole life,
+        // so none of them may go back to the allocator. Collected into a local
+        // because `command` holds the server borrow until it is dropped.
+        let mut hold_now: Vec<Binding> = Vec::new();
+        let capturing = crate::compute::CAPTURE_OPEN.load(core::sync::atomic::Ordering::Relaxed)
+            && capture_hold_enabled();
+        if capturing {
+            hold_now.extend(bindings.tensor_maps.iter().map(|it| it.binding.clone()));
+            hold_now.extend(bindings.buffers.iter().cloned());
+            // The metadata buffer `create_with_data` just produced is bound
+            // below and dies at the end of this call, which makes it the FIRST
+            // slice the allocator offers the next launch of the same region.
+            if let Some(h) = info_binding.as_ref() {
+                hold_now.push(h.clone().binding());
+            }
+        }
 
         let mut resources = bindings
             .tensor_maps
@@ -1104,6 +1148,8 @@ impl CudaServer {
             info_const,
             logger,
         )?;
+        core::mem::drop(command);
+        self.capture_hold.append(&mut hold_now);
 
         Ok(())
     }
