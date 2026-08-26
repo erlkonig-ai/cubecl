@@ -9,6 +9,20 @@ mod runtime;
 pub use device::*;
 pub use runtime::*;
 
+/// Forming an NCCL group that spans PROCESSES, not just devices.
+///
+/// The collectives themselves need nothing from here — `client.all_reduce` is
+/// the same call either way. What this module exists for is the GROUP: the
+/// built-in path mints a communicator id in a process-global map and derives
+/// each rank from its device index, which is right for one process holding
+/// several GPUs and cannot describe two processes on two boxes that each hold
+/// their own device 0. Mint the id on one rank, ship the 128 bytes yourself,
+/// and call [`collective::set_external_comm`] on every rank before the first
+/// collective.
+pub mod collective {
+    pub use crate::compute::communication::{ExternalComm, mint_unique_id, set_external_comm};
+}
+
 #[cfg(feature = "ptx-wmma")]
 pub(crate) type WmmaCompiler = cubecl_cpp::cuda::mma::PtxWmmaCompiler;
 

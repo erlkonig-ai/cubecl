@@ -4,7 +4,7 @@ use crate::{
     CudaCompiler,
     compute::{
         command::Command,
-        communication::{get_nccl_comm_id, get_nccl_dtype_count, to_nccl_op},
+        communication::{external_comm, get_nccl_comm_id, get_nccl_dtype_count, to_nccl_op},
         context::CudaContext,
         stream::CudaStreamBackend,
         sync::Fence,
@@ -347,11 +347,25 @@ impl ServerCommunication for CudaServer {
             let mut comm = MaybeUninit::uninit();
             let mut device_ids = device_ids.clone();
             device_ids.sort();
-            let rank = device_ids
-                .iter()
-                .position(|id| id.index_id == self.device_id.index_id)
-                .expect("Device's peer id should be in the list of device ids.");
-            let nccl_comm_id = get_nccl_comm_id(device_ids.clone());
+            // A group formed OUTSIDE this process wins, and takes all three
+            // numbers with it. The single-process derivation below cannot serve
+            // two nodes: each would mint its own id (so the rendezvous hangs
+            // rather than fails) and each would derive rank 0 from its own local
+            // device 0. See `communication::set_external_comm`.
+            let (world, rank, nccl_comm_id) = match external_comm() {
+                Some(ext) => (ext.world, ext.rank, ext.id),
+                None => {
+                    let rank = device_ids
+                        .iter()
+                        .position(|id| id.index_id == self.device_id.index_id)
+                        .expect("Device's peer id should be in the list of device ids.");
+                    (
+                        device_ids.len() as i32,
+                        rank as i32,
+                        get_nccl_comm_id(device_ids.clone()),
+                    )
+                }
+            };
 
             // SAFETY: `comm` is a valid `MaybeUninit`. `nccl_comm_id` is a unique communicator ID
             // shared across all participating ranks. `rank` is this device's position in the
@@ -359,9 +373,9 @@ impl ServerCommunication for CudaServer {
             unsafe {
                 cudarc::nccl::result::comm_init_rank(
                     comm.as_mut_ptr(),
-                    device_ids.len() as i32,
+                    world,
                     nccl_comm_id,
-                    rank as i32,
+                    rank,
                 )
                 .map_err(|e| ServerError::Generic {
                     reason: format!("NCCL comm_init_rank failed: {e:?}"),
