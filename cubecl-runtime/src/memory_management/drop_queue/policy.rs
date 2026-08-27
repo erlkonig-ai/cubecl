@@ -15,6 +15,37 @@ pub struct FlushingPolicy {
 
 /// The staged-allocation count a flush triggers at, overridable at runtime.
 ///
+/// MEASURED AND FOUND NOT TO HELP -- IT HURTS. Recorded here rather than in a
+/// commit message, because a knob that was tried and rejected is exactly the
+/// artifact that evaporates and gets re-proposed six weeks later.
+///
+/// FRAMING: ms per decode step, two-node pipeline (head zgx-16ec layers 0:21,
+/// tail zgx-0d6e layers 21:42), ctx3732, INK_KV=1, INK_GEN=64, 7 reps, arms
+/// interleaved within each rep, byte-identical binaries on both boxes, both
+/// gated idle. Median over 62 warm passes per rep.
+///
+///   64      88.6  88.6  88.2  88.7  88.7  88.2  88.1   median 88.6, spread 0.7%
+///   4096    89.3  92.3  94.2  90.2  97.6  96.7  92.2   median 92.3, spread 9.3%
+///
+/// -4.00% on median tok/s, against ~1.1% resolution at 2 sem for 7 reps. The
+/// bands do not overlap: 4096's BEST rep (89.3) is worse than 64's WORST
+/// (88.7). It is also nine times noisier, which is the more interesting half --
+/// a change that widens the spread that much is doing something structural to
+/// the step, not adding a constant.
+///
+/// What this does NOT establish is that the stalls were free. It establishes
+/// that this particular cure costs more than they are worth. The queue holds
+/// staged buffers for two cycles, so at 4096 it can hold 8192 pinned host
+/// buffers where 64 holds 128, and pinned pages cannot be reclaimed on a box
+/// whose weights are read through the page cache. Separating "the stalls were
+/// free" from "the retention costs more than the stalls" needs the cure that
+/// removes the REASON rather than the frequency: a metadata cache, so that a
+/// launch whose shapes have not changed uploads nothing and stages nothing.
+/// See mary's docs/METADATA_CACHE.md.
+///
+/// The knob stays because it is the instrument that produced this row, and
+/// because 512 is a different question from 4096. It is not a lever to ship.
+///
 /// WHY THIS IS A KNOB AND WHAT IT MEASURES. A flush waits on the fence from the
 /// PREVIOUS flush cycle, so it blocks the launching thread until the device has
 /// drained to a point one batch back. That wait needs no VALUE from the device
