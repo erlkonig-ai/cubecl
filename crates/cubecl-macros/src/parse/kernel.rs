@@ -121,12 +121,15 @@ impl GenericAnalysis {
         let mut output = quote![];
         let self_ = has_self.then(|| quote![self.]);
 
+        let mut generics = self.map.iter().collect::<Vec<_>>();
+        generics.sort_unstable_by_key(|(ident, _)| ident.to_string());
+
         for (
             ident,
             GenericArg {
                 kind, expand_ty, ..
             },
-        ) in self.map.iter()
+        ) in generics
         {
             let name = match name_mapping.remove(ident) {
                 Some((name, index)) => match index {

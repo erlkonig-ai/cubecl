@@ -179,6 +179,9 @@ impl Launch {
     fn create_type_alias(&self) -> TokenStream {
         let mut aliases = quote! {};
         if !self.func.args.explicit_define.is_present() {
+            let mut generics = self.func.analysis.map.iter().collect::<Vec<_>>();
+            generics.sort_unstable_by_key(|(ident, _)| ident.to_string());
+
             for (
                 name,
                 GenericArg {
@@ -186,7 +189,7 @@ impl Launch {
                     marker_ty,
                     ..
                 },
-            ) in self.func.analysis.map.iter()
+            ) in generics
             {
                 aliases.extend(quote! {
                     pub struct #marker_ty;
@@ -268,5 +271,38 @@ impl Launch {
             .parameters
             .iter()
             .filter(|param| param.is_const)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::kernel::KernelArgs;
+
+    #[test]
+    fn generic_expansion_is_reproducible() {
+        let expand = || {
+            let function = syn::parse_quote! {
+                fn all_generics<
+                    A: Float,
+                    B: Int,
+                    C: Numeric,
+                    D: Size,
+                    E: CubePrimitive,
+                    F: Float,
+                    G: Int,
+                    H: Size,
+                >() {}
+            };
+            Launch::from_item_fn(function, KernelArgs::default())
+                .unwrap()
+                .into_token_stream()
+                .to_string()
+        };
+
+        let expected = expand();
+        for _ in 0..64 {
+            assert_eq!(expand(), expected);
+        }
     }
 }
