@@ -135,10 +135,17 @@ impl CudaContext {
 
         self.validate_shared(&kernel_compiled.repr)?;
 
-        if logger.compilation_activated() {
-            kernel_compiled.debug_info = Some(DebugInformation::new("cpp", kernel_id.clone()));
+        // A source that is already PTX -- every PTX module opens with the
+        // `.version` directive -- goes to the driver as it is: NVRTC cannot
+        // take PTX, and clang-format must not touch it. Hand-written kernels
+        // are wanted as assembly, not C++ (JP, 2026-08-30).
+        let is_ptx = is_ptx_source(&kernel_compiled.source);
 
-            if let Ok(formatted) = format_cpp(&kernel_compiled.source) {
+        if logger.compilation_activated() {
+            let lang = if is_ptx { "ptx" } else { "cpp" };
+            kernel_compiled.debug_info = Some(DebugInformation::new(lang, kernel_id.clone()));
+
+            if !is_ptx && let Ok(formatted) = format_cpp(&kernel_compiled.source) {
                 kernel_compiled.source = formatted;
             }
         }
@@ -160,6 +167,31 @@ impl CudaContext {
         }
 
         logger.log_compilation(&kernel_compiled);
+
+        if is_ptx {
+            // Straight to `load_ptx`, which is the one call NVRTC's output
+            // goes through too. Not written to the PTX cache: that cache
+            // exists to skip NVRTC, and there is no NVRTC here to skip -- a
+            // hit would hand `load_ptx` the same bytes this does.
+            let repr = kernel_compiled.repr.unwrap();
+            let ptx = CString::new(kernel_compiled.source)
+                .map_err(|err| CompilationError::Generic {
+                    reason: format!("PTX source holds a NUL byte: {err}"),
+                    backtrace: BackTrace::capture(),
+                })?
+                .into_bytes_with_nul()
+                .into_iter()
+                .map(|b| b as c_char)
+                .collect();
+            self.load_ptx(
+                ptx,
+                kernel_id.clone(),
+                kernel_compiled.entrypoint_name,
+                cube_dim,
+                repr.shared_memory_size(),
+            )?;
+            return Ok(());
+        }
 
         // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX from a program.
         // The `CString` source is null-terminated and outlives the program. On compilation
@@ -245,7 +277,7 @@ impl CudaContext {
         shared_mem_bytes: usize,
     ) -> Result<(), CompilationError> {
         let func_name = CString::new(entrypoint_name).unwrap();
-        // SAFETY: `ptx` is a valid null-terminated PTX binary from NVRTC. `func_name` is a
+        // SAFETY: `ptx` is null-terminated PTX text, from NVRTC or handed in directly. `func_name` is a
         // null-terminated `CString` matching the kernel entry point in the compiled module.
         let func = unsafe {
             let module = cudarc::driver::result::module::load_data(ptx.as_ptr() as *const _)
@@ -359,6 +391,23 @@ impl CudaContext {
             .into())
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Whether `source` is a PTX module rather than CUDA C++: past leading
+/// whitespace and comments (`//` to end of line, `/* */`), its first token is
+/// the `.version` directive, which the PTX ISA requires to open every module.
+fn is_ptx_source(source: &str) -> bool {
+    let mut s = source;
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("//") {
+            s = rest.split_once('\n').map_or("", |(_, r)| r);
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.split_once("*/").map_or("", |(_, r)| r);
+        } else {
+            return s.starts_with(".version");
         }
     }
 }
