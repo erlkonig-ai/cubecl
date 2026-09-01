@@ -1,0 +1,3 @@
+# Rust build products belong outside source history, including targets created
+# from a member crate rather than the workspace root.
+**/target/
