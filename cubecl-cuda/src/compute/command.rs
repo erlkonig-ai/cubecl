@@ -679,6 +679,13 @@ pub struct CapturedNode {
     pub shared: u32,
 }
 
+/// Whether a capture OWNS the pinned host buffers its memcpy nodes read from.
+/// On by default; see the comment at its only use.
+fn capture_stage_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUBECL_GRAPH_STAGE_OWN").as_deref() != Ok("0"))
+}
+
 /// Internal write to GPU command.
 ///
 /// Writes data from a CPU buffer to a CUDA resource.
@@ -693,12 +700,6 @@ pub struct CapturedNode {
     feature = "tracing",
     tracing::instrument(level = "trace", skip(strides, data, dst_ptr, stream))
 )]
-/// Whether a capture OWNS the pinned host buffers its memcpy nodes read from.
-/// On by default; see the comment at its only use.
-fn capture_stage_own() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CUBECL_GRAPH_STAGE_OWN").as_deref() != Ok("0"))
-}
 
 pub(crate) unsafe fn write_to_gpu(
     shape: &Shape,
