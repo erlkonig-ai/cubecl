@@ -1,4 +1,4 @@
-use crate::compute::uninit_vec;
+use crate::compute::{host_stall_trace, uninit_vec};
 extern crate alloc;
 use cubecl_common::backtrace::BackTrace;
 use cubecl_core::server::IoError;
@@ -254,7 +254,9 @@ impl ComputeStorage for GpuStorage {
                 eprintln!("[graph-trace] taken by:\n{}", std::backtrace::Backtrace::force_capture());
             }
         }
+        let span = host_stall_trace::start(host_stall_trace::Operation::AllocAsync, size);
         let ptr = unsafe { cudarc::driver::result::malloc_async(self.stream, size as usize) };
+        host_stall_trace::finish(span, || format!("success={}", ptr.is_ok()));
         let (ptr, kind) = match ptr {
             Ok(ptr) => (ptr, AllocationKind::Async),
             Err(_) => unsafe {
@@ -262,7 +264,10 @@ impl ComputeStorage for GpuStorage {
                     "[graph-trace] malloc_async FAILED for {size} bytes -- falling back to the \
                      SYNCHRONOUS cuMemAlloc, which invalidates any open capture"
                 );
-                match cudarc::driver::result::malloc_sync(size as usize) {
+                let span = host_stall_trace::start(host_stall_trace::Operation::AllocSync, size);
+                let ptr = cudarc::driver::result::malloc_sync(size as usize);
+                host_stall_trace::finish(span, || format!("success={}", ptr.is_ok()));
+                match ptr {
                     Ok(ptr) => (ptr, AllocationKind::Sync),
                     Err(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY)) => {
                         return Err(IoError::BufferTooBig {

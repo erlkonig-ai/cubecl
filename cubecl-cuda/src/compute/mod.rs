@@ -1,6 +1,7 @@
 pub(crate) mod command;
 pub(crate) mod communication;
 pub(crate) mod context;
+pub(crate) mod host_stall_trace;
 pub(crate) mod io;
 pub(crate) mod meta_cache;
 pub(crate) mod storage;

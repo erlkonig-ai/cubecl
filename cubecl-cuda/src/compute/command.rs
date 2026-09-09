@@ -1,7 +1,7 @@
 use crate::{
     CudaCompiler,
     compute::{
-        MB, context::CudaContext, io::controller::PinnedMemoryManagedAllocController,
+        MB, context::CudaContext, host_stall_trace, io::controller::PinnedMemoryManagedAllocController,
         storage::gpu::GpuResource, stream::CudaStreamBackend, sync::Fence,
     },
 };
@@ -542,7 +542,12 @@ impl<'a> Command<'a> {
         logger: Arc<ServerLogger>,
     ) -> Result<Option<CapturedNode>, LaunchError> {
         if !self.ctx.module_names.contains_key(&kernel_id) {
-            self.ctx.compile_kernel(&kernel_id, kernel, mode, logger)?;
+            let span = host_stall_trace::start(host_stall_trace::Operation::CompileMiss, 0);
+            let compiled = self.ctx.compile_kernel(&kernel_id, kernel, mode, logger);
+            host_stall_trace::finish(span, || {
+                format!("kernel={} success={}", kernel_id.stable_hash(), compiled.is_ok())
+            });
+            compiled?;
         }
 
         let stream = self.streams.current();
@@ -584,7 +589,11 @@ impl<'a> Command<'a> {
         // drains it. Callers are expected to pre-flush before capturing so the
         // deferral spans one region, not the whole run.
         if !stream.capturing && stream.drop_queue.should_flush() {
+            let span = host_stall_trace::start(host_stall_trace::Operation::DropFlush, 0);
             stream.drop_queue.flush(|| Fence::new(stream.sys));
+            host_stall_trace::finish(span, || {
+                "may_include_prior_gpu_or_peer_work=true".to_string()
+            });
         }
 
         if let Err(err) = result {
