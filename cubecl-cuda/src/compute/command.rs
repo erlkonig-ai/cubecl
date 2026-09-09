@@ -224,6 +224,21 @@ impl<'a> Command<'a> {
         &mut self,
         descriptors: Vec<CopyDescriptor>,
     ) -> impl Future<Output = Result<Vec<Bytes>, ServerError>> + Send + use<> {
+        let span = host_stall_trace::start_with_bytes(
+            host_stall_trace::Operation::ReadbackEnqueue,
+            || {
+                descriptors.iter().fold(0_u64, |total, descriptor| {
+                    total.saturating_add(descriptor.shape.iter().fold(
+                        descriptor.elem_size as u64,
+                        |bytes, &dim| bytes.saturating_mul(dim as u64),
+                    ))
+                })
+            },
+        );
+        let request_bytes = span.as_ref().map_or(0, |span| span.requested_bytes());
+        let descriptor_count = descriptors.len();
+        let stream_id = self.streams.current;
+        let stream_cursor = self.cursor();
         let descriptors_moved = descriptors
             .iter()
             .map(|b| b.handle.clone())
@@ -231,9 +246,27 @@ impl<'a> Command<'a> {
 
         let result = self.copies_to_bytes(descriptors, true);
         let fence = Fence::new(self.streams.current().sys);
+        host_stall_trace::finish(span, || {
+            format!(
+                "descriptors={descriptor_count} stream_id={stream_id} stream_cursor={stream_cursor} success={} \
+                 scope=host_buffer_prepare_d2h_enqueue_and_fence_record",
+                result.is_ok(),
+            )
+        });
 
         async move {
-            let sync = fence.wait_sync();
+            // Start only once polled: future scheduling delay is not a CUDA
+            // wait. This event also covers any prior GPU/peer work on stream.
+            let sync = fence.wait_sync_traced(
+                host_stall_trace::Operation::ReadbackWait,
+                request_bytes,
+                || {
+                    format!(
+                        "descriptors={descriptor_count} stream_id={stream_id} stream_cursor={stream_cursor} \
+                         scope=cuda_event_synchronize may_include_prior_gpu_or_peer_work=true",
+                    )
+                },
+            );
             // Release memory handle.
             core::mem::drop(descriptors_moved);
 
@@ -574,6 +607,10 @@ impl<'a> Command<'a> {
             true => self.ctx.kernel_launch_shape(&kernel_id),
             false => None,
         };
+        let span = host_stall_trace::start(host_stall_trace::Operation::KernelEnqueue, 0);
+        // Retain the cheap Arc-backed ID only with tracing on; hash it only
+        // when a slow submission actually needs a diagnostic line.
+        let trace_kernel = span.as_ref().map(|_| kernel_id.clone());
         let result = self.ctx.execute_task(
             stream,
             kernel_id,
@@ -582,6 +619,18 @@ impl<'a> Command<'a> {
             resources,
             const_info,
         );
+        host_stall_trace::finish(span, || {
+            format!(
+                "kernel={} grid={},{},{} capturing={} success={} \
+                 scope=argument_prepare_function_attribute_and_launch",
+                trace_kernel.unwrap().stable_hash(),
+                dispatch_count.0,
+                dispatch_count.1,
+                dispatch_count.2,
+                stream.capturing,
+                result.is_ok(),
+            )
+        });
 
         // `flush` waits on a fence -- `cuEventSynchronize` -- which is exactly
         // the host block a capture cannot contain. Deferring it is safe: the

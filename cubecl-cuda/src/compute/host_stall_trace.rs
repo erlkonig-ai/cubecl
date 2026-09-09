@@ -7,8 +7,12 @@
 //! miss means absent from the in-process module map; a disk PTX cache may hit.
 //!
 //! These are HOST durations around existing calls, with no extra CUDA sync.
-//! Allocation and drop-flush waits may include prior GPU/peer work; they are not
-//! GPU execution times or proof of a cause. Totals can overlap across threads.
+//! Allocation, readback and event waits may include prior GPU/peer work; they
+//! are not GPU execution times or proof of a cause. Readback waits time the
+//! existing CUDA event synchronization when the future is polled, excluding
+//! time waiting for that first poll. Enqueue spans measure host submission, not
+//! device completion. Totals can overlap across threads and nested operations
+//! (for example, a generic event wait inside a drop-flush span).
 //! The logging itself is outside the measured interval. A hung call cannot emit
 //! its completion line. The flag is read once, before the first traced call.
 
@@ -29,7 +33,14 @@ pub(crate) enum Operation {
     AllocAsync,
     AllocSync,
     DropFlush,
+    ReadbackEnqueue,
+    ReadbackWait,
+    EventWait,
+    KernelEnqueue,
+    CollectiveEnqueue,
 }
+
+const OPERATION_COUNT: usize = Operation::CollectiveEnqueue as usize + 1;
 
 impl Operation {
     fn name(self) -> &'static str {
@@ -38,6 +49,11 @@ impl Operation {
             Self::AllocAsync => "alloc_async",
             Self::AllocSync => "alloc_sync",
             Self::DropFlush => "drop_flush",
+            Self::ReadbackEnqueue => "readback_enqueue",
+            Self::ReadbackWait => "readback_wait",
+            Self::EventWait => "event_wait",
+            Self::KernelEnqueue => "kernel_enqueue",
+            Self::CollectiveEnqueue => "collective_enqueue",
         }
     }
 }
@@ -68,7 +84,7 @@ impl Totals {
 
 struct Trace {
     started: Instant,
-    totals: [Totals; 4],
+    totals: [Totals; OPERATION_COUNT],
 }
 
 pub(crate) struct Span {
@@ -78,11 +94,25 @@ pub(crate) struct Span {
     started: Instant,
 }
 
+impl Span {
+    pub(crate) fn requested_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 fn enabled_value(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
 pub(crate) fn start(operation: Operation, bytes: u64) -> Option<Span> {
+    start_with_bytes(operation, || bytes)
+}
+
+/// Compute request metadata only when tracing is enabled.
+pub(crate) fn start_with_bytes(
+    operation: Operation,
+    bytes: impl FnOnce() -> u64,
+) -> Option<Span> {
     static TRACE: OnceLock<Option<Trace>> = OnceLock::new();
     let trace = TRACE.get_or_init(|| {
         enabled_value(std::env::var("CUBECL_HOST_STALL_TRACE").ok().as_deref()).then(|| Trace {
@@ -90,10 +120,18 @@ pub(crate) fn start(operation: Operation, bytes: u64) -> Option<Span> {
             totals: Default::default(),
         })
     });
-    trace.as_ref().map(|trace| Span {
+    span_for_trace(trace.as_ref(), operation, bytes)
+}
+
+fn span_for_trace(
+    trace: Option<&'static Trace>,
+    operation: Operation,
+    bytes: impl FnOnce() -> u64,
+) -> Option<Span> {
+    trace.map(|trace| Span {
         trace,
         operation,
-        bytes,
+        bytes: bytes(),
         started: Instant::now(),
     })
 }
@@ -119,11 +157,12 @@ pub(crate) fn finish(span: Option<Span>, details: impl FnOnce() -> String) {
     // transaction. Do not let an unavailable diagnostic sink fail the workload.
     let _ = writeln!(
         std::io::stderr().lock(),
-        "[cubecl-host-stall] end_unix_ms={unix_ms} trace_ms={} pid={} external_rank={rank} \
+        "[cubecl-host-stall] end_unix_ms={unix_ms} trace_ms={} pid={} thread={:?} external_rank={rank} \
          op={} host_ms={:.3} request_bytes={} calls_total={} slow_calls_total={} \
          host_ms_total={:.3} requested_bytes_total={} timing=host_call_not_gpu {}",
         span.trace.started.elapsed().as_millis(),
         std::process::id(),
+        std::thread::current().id(),
         span.operation.name(),
         elapsed.as_secs_f64() * 1000.0,
         span.bytes,
@@ -161,9 +200,38 @@ mod tests {
 
     #[test]
     fn operation_totals_are_separate() {
-        let totals: [Totals; 4] = Default::default();
+        let totals: [Totals; OPERATION_COUNT] = Default::default();
         totals[Operation::AllocAsync as usize].record(THRESHOLD, 512);
-        for operation in [Operation::CompileMiss, Operation::AllocSync, Operation::DropFlush] {
+        for operation in [
+            Operation::CompileMiss,
+            Operation::AllocSync,
+            Operation::DropFlush,
+            Operation::ReadbackEnqueue,
+            Operation::ReadbackWait,
+            Operation::EventWait,
+            Operation::KernelEnqueue,
+            Operation::CollectiveEnqueue,
+        ] {
+            assert_eq!(totals[operation as usize].calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn readback_wait_totals_are_not_enqueue_or_generic_event_totals() {
+        let totals: [Totals; OPERATION_COUNT] = Default::default();
+        let readback = &totals[Operation::ReadbackWait as usize];
+        assert!(!readback.record(Duration::from_millis(20), 4096));
+        assert!(readback.record(Duration::from_secs(29), 4096));
+        assert_eq!(readback.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(readback.slow_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(readback.host_micros.load(Ordering::Relaxed), 29_020_000);
+        assert_eq!(readback.requested_bytes.load(Ordering::Relaxed), 8192);
+        for operation in [
+            Operation::ReadbackEnqueue,
+            Operation::EventWait,
+            Operation::KernelEnqueue,
+            Operation::CollectiveEnqueue,
+        ] {
             assert_eq!(totals[operation as usize].calls.load(Ordering::Relaxed), 0);
         }
     }
@@ -171,5 +239,15 @@ mod tests {
     #[test]
     fn disabled_tracing_does_not_format_details() {
         finish(None, || panic!("disabled trace formatted its details"));
+    }
+
+    #[test]
+    fn disabled_tracing_does_not_count_request_bytes() {
+        assert!(
+            span_for_trace(None, Operation::ReadbackEnqueue, || {
+                panic!("disabled trace evaluated request metadata")
+            })
+            .is_none()
+        );
     }
 }

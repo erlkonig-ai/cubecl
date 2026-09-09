@@ -6,6 +6,7 @@ use crate::{
         command::Command,
         communication::{external_comm, get_nccl_comm_id, get_nccl_dtype_count, to_nccl_op},
         context::CudaContext,
+        host_stall_trace,
         meta_cache::{self, MetaCacheMode},
         stream::CudaStreamBackend,
         sync::Fence,
@@ -1136,7 +1137,11 @@ impl ServerCommunication for CudaServer {
         // `comm` is a valid NCCL communicator initialized via `comm_init_rank`.
         // `self.comm_stream` is a valid CUDA stream dedicated to collective operations.
 
-        unsafe {
+        let span = host_stall_trace::start(
+            host_stall_trace::Operation::CollectiveEnqueue,
+            resource_src.size,
+        );
+        let result = unsafe {
             cudarc::nccl::result::all_reduce(
                 resource_src.ptr as *const _,
                 resource_dst.ptr as *mut _,
@@ -1146,11 +1151,18 @@ impl ServerCommunication for CudaServer {
                 *comm,
                 self.comm_stream as _,
             )
-            .map_err(|e| ServerError::Generic {
-                reason: format!("NCCL all_reduce failed: {e:?}"),
-                backtrace: BackTrace::capture(),
-            })?;
-        }
+        };
+        host_stall_trace::finish(span, || {
+            format!(
+                "collective=all_reduce elements={count} dtype={nccl_dtype:?} success={} \
+                 scope=nccl_host_enqueue_not_collective_completion",
+                result.is_ok(),
+            )
+        });
+        result.map_err(|e| ServerError::Generic {
+            reason: format!("NCCL all_reduce failed: {e:?}"),
+            backtrace: BackTrace::capture(),
+        })?;
 
         Ok(())
     }

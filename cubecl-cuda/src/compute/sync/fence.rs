@@ -2,6 +2,8 @@ use cubecl_common::backtrace::BackTrace;
 use cubecl_core::server::ServerError;
 use cudarc::driver::sys::{CUevent_flags, CUevent_st, CUevent_wait_flags, CUstream_st};
 
+use crate::compute::host_stall_trace::{self, Operation};
+
 /// A fence is simply an [event](CUevent_st) created on a [stream](CUevent_st) that you can wait
 /// until completion.
 ///
@@ -41,12 +43,35 @@ impl Fence {
 
     /// Wait for the [Fence] to be reached, ensuring that all previous tasks enqueued to the
     /// [stream](CUstream_st) are completed.
+    #[track_caller]
     pub fn wait_sync(self) -> Result<(), ServerError> {
+        let caller = std::panic::Location::caller();
+        self.wait_sync_traced(Operation::EventWait, 0, || {
+            format!(
+                "caller={caller} scope=cuda_event_synchronize \
+                 may_include_prior_gpu_or_peer_work=true",
+            )
+        })
+    }
+
+    /// The same existing wait, with caller context instead of a second nested
+    /// event-wait span. In particular, a readback is not counted twice.
+    pub(crate) fn wait_sync_traced(
+        self,
+        operation: Operation,
+        bytes: u64,
+        details: impl FnOnce() -> String,
+    ) -> Result<(), ServerError> {
         // SAFETY: `self.event` is a valid event created in `Fence::new`. We synchronize
         // (block) until the event completes, then destroy it. `self` is consumed so the
         // event cannot be double-freed.
         unsafe {
-            cudarc::driver::result::event::synchronize(self.event).map_err(|err| {
+            let span = host_stall_trace::start(operation, bytes);
+            let result = cudarc::driver::result::event::synchronize(self.event);
+            host_stall_trace::finish(span, || {
+                format!("success={} {}", result.is_ok(), details())
+            });
+            result.map_err(|err| {
                 ServerError::Generic {
                     reason: format!("{err:?}"),
                     backtrace: BackTrace::capture(),
