@@ -14,7 +14,9 @@
 //! device completion. Totals can overlap across threads and nested operations
 //! (for example, a generic event wait inside a drop-flush span).
 //! The logging itself is outside the measured interval. A hung call cannot emit
-//! its completion line. The flag is read once, before the first traced call.
+//! its completion line. [`host_operation_snapshot`] also exposes totals when no
+//! call crosses the logging threshold. The flag is read once, on the first
+//! traced call or explicit snapshot.
 
 use std::{
     io::Write,
@@ -41,6 +43,17 @@ pub(crate) enum Operation {
 }
 
 const OPERATION_COUNT: usize = Operation::CollectiveEnqueue as usize + 1;
+const OPERATIONS: [Operation; OPERATION_COUNT] = [
+    Operation::CompileMiss,
+    Operation::AllocAsync,
+    Operation::AllocSync,
+    Operation::DropFlush,
+    Operation::ReadbackEnqueue,
+    Operation::ReadbackWait,
+    Operation::EventWait,
+    Operation::KernelEnqueue,
+    Operation::CollectiveEnqueue,
+];
 
 impl Operation {
     fn name(self) -> &'static str {
@@ -87,6 +100,76 @@ struct Trace {
     totals: [Totals; OPERATION_COUNT],
 }
 
+static TRACE: OnceLock<Option<Trace>> = OnceLock::new();
+
+fn active_trace() -> Option<&'static Trace> {
+    TRACE.get_or_init(|| {
+        enabled_value(std::env::var("CUBECL_HOST_STALL_TRACE").ok().as_deref()).then(|| Trace {
+            started: Instant::now(),
+            totals: Default::default(),
+        })
+    }).as_ref()
+}
+
+/// Independently loaded, cumulative counters for one kind of completed host call.
+///
+/// These are relaxed observations, not an atomic transaction. A concurrent
+/// completion can become visible in one field before another. Requested bytes
+/// include failed requests and are not resident bytes. Durations can include
+/// prior GPU/peer work and overlap other operations; they must not be summed as
+/// GPU execution time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostOperationCounters {
+    pub operation: &'static str,
+    pub calls_total: u64,
+    pub slow_calls_total: u64,
+    pub host_micros_total: u64,
+    pub requested_bytes_total: u64,
+}
+
+/// Process-wide host counters, including calls below the 100 ms logging threshold.
+///
+/// All counters are sampled independently with relaxed atomic loads. Calls
+/// still in progress are not recorded. This snapshot does not synchronize with
+/// GPU work, lock an allocator, reset counters, or emit a log line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostOperationSnapshot {
+    pub pid: u32,
+    /// Wall-clock milliseconds since the Unix epoch, if the clock permits it.
+    pub unix_ms: Option<u128>,
+    /// Monotonic milliseconds since this process initialized host tracing.
+    pub trace_ms: u128,
+    pub operations: [HostOperationCounters; OPERATION_COUNT],
+}
+
+/// Read opt-in host counters without CUDA calls, GPU synchronization, or reset.
+///
+/// Returns `None` unless `CUBECL_HOST_STALL_TRACE=1` at the first traced call or
+/// snapshot. An enabled snapshot taken before any operation contains zero
+/// counters. Values are cumulative, relaxed per-counter observations, not an
+/// atomic cross-thread snapshot; see [`HostOperationCounters`].
+pub fn host_operation_snapshot() -> Option<HostOperationSnapshot> {
+    snapshot_for_trace(active_trace())
+}
+
+fn snapshot_for_trace(trace: Option<&Trace>) -> Option<HostOperationSnapshot> {
+    trace.map(|trace| HostOperationSnapshot {
+        pid: std::process::id(),
+        unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis()),
+        trace_ms: trace.started.elapsed().as_millis(),
+        operations: OPERATIONS.map(|operation| {
+            let totals = &trace.totals[operation as usize];
+            HostOperationCounters {
+                operation: operation.name(),
+                calls_total: totals.calls.load(Ordering::Relaxed),
+                slow_calls_total: totals.slow_calls.load(Ordering::Relaxed),
+                host_micros_total: totals.host_micros.load(Ordering::Relaxed),
+                requested_bytes_total: totals.requested_bytes.load(Ordering::Relaxed),
+            }
+        }),
+    })
+}
+
 pub(crate) struct Span {
     trace: &'static Trace,
     operation: Operation,
@@ -113,14 +196,7 @@ pub(crate) fn start_with_bytes(
     operation: Operation,
     bytes: impl FnOnce() -> u64,
 ) -> Option<Span> {
-    static TRACE: OnceLock<Option<Trace>> = OnceLock::new();
-    let trace = TRACE.get_or_init(|| {
-        enabled_value(std::env::var("CUBECL_HOST_STALL_TRACE").ok().as_deref()).then(|| Trace {
-            started: Instant::now(),
-            totals: Default::default(),
-        })
-    });
-    span_for_trace(trace.as_ref(), operation, bytes)
+    span_for_trace(active_trace(), operation, bytes)
 }
 
 fn span_for_trace(
@@ -249,5 +325,55 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn disabled_snapshot_is_absent() {
+        assert!(snapshot_for_trace(None).is_none());
+    }
+
+    #[test]
+    fn snapshot_exposes_fast_calls_and_zeroes_without_resetting() {
+        let trace = Trace { started: Instant::now(), totals: Default::default() };
+        let initial = snapshot_for_trace(Some(&trace)).unwrap();
+        assert_eq!(initial.pid, std::process::id());
+        assert!(initial.operations.iter().all(|op| op.calls_total == 0
+            && op.slow_calls_total == 0 && op.host_micros_total == 0
+            && op.requested_bytes_total == 0));
+
+        let allocation = &trace.totals[Operation::AllocAsync as usize];
+        assert!(!allocation.record(Duration::from_micros(250), 1024));
+        assert!(!allocation.record(Duration::from_micros(750), 2048));
+        let snapshot = snapshot_for_trace(Some(&trace)).unwrap();
+        let expected = HostOperationCounters {
+            operation: "alloc_async", calls_total: 2, slow_calls_total: 0,
+            host_micros_total: 1000, requested_bytes_total: 3072,
+        };
+        assert_eq!(snapshot.operations[Operation::AllocAsync as usize], expected);
+        assert_eq!(snapshot_for_trace(Some(&trace)).unwrap().operations, snapshot.operations);
+        assert!(snapshot.operations.iter().filter(|op| op.operation != "alloc_async")
+            .all(|op| op.calls_total == 0 && op.requested_bytes_total == 0));
+
+        assert!(allocation.record(THRESHOLD, 4096));
+        let later = snapshot_for_trace(Some(&trace)).unwrap();
+        assert_eq!(later.operations[Operation::AllocAsync as usize], HostOperationCounters {
+            operation: "alloc_async", calls_total: 3, slow_calls_total: 1,
+            host_micros_total: 101_000, requested_bytes_total: 7168,
+        });
+        assert_eq!(snapshot.operations[Operation::AllocAsync as usize], expected);
+    }
+
+    #[test]
+    fn snapshot_enumerates_each_operation_once_in_counter_order() {
+        for (index, operation) in OPERATIONS.into_iter().enumerate() {
+            assert_eq!(operation as usize, index);
+        }
+        let trace = Trace { started: Instant::now(), totals: Default::default() };
+        let snapshot = snapshot_for_trace(Some(&trace)).unwrap();
+        assert_eq!(snapshot.operations.map(|op| op.operation), [
+            "compile_miss", "alloc_async", "alloc_sync", "drop_flush",
+            "readback_enqueue", "readback_wait", "event_wait", "kernel_enqueue",
+            "collective_enqueue",
+        ]);
     }
 }

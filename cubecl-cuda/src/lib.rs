@@ -8,6 +8,9 @@ mod runtime;
 
 pub use device::*;
 pub use runtime::*;
+pub use compute::host_stall_trace::{
+    HostOperationCounters, HostOperationSnapshot, host_operation_snapshot,
+};
 
 /// Forming an NCCL group that spans PROCESSES, not just devices.
 ///
