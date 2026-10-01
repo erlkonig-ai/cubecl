@@ -1,0 +1,1420 @@
+use super::Handle;
+use crate::{
+    client::ComputeClient,
+    compiler::CompilationError,
+    config::{CubeClRuntimeConfig, RuntimeConfig, compilation::BoundsCheckMode},
+    kernel::KernelMetadata,
+    logging::ServerLogger,
+    memory_management::{ArenaStats, ManagedMemoryHandle, MemoryAllocationMode, MemoryUsage},
+    runtime::Runtime,
+    server::Binding,
+    storage::{ComputeStorage, ManagedResource},
+    tma::{OobFill, TensorMapFormat, TensorMapInterleave, TensorMapPrefetch, TensorMapSwizzle},
+};
+use ahash::AHasher;
+use alloc::boxed::Box;
+#[cfg(feature = "profile-tracy")]
+use alloc::format;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::{
+    fmt::Debug,
+    hash::{Hash, Hasher},
+};
+use cubecl_common::{
+    backtrace::BackTrace,
+    bytes::Bytes,
+    device::{self, DeviceId},
+    future::DynFut,
+    profile::ProfileDuration,
+    stream_id::StreamId,
+    stub::RwLock,
+};
+use cubecl_ir::{DeviceProperties, ElemType, StorageType};
+use cubecl_zspace::{Shape, Strides, metadata::Metadata};
+use hashbrown::HashSet;
+use thiserror::Error;
+
+#[derive(Error, Clone)]
+#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+/// An error during profiling.
+pub enum ProfileError {
+    /// An unknown error happened during profiling
+    #[error(
+        "An unknown error happened during profiling\nCaused by:\n  {reason}\nBacktrace:\n{backtrace}"
+    )]
+    Unknown {
+        /// The caused of the error
+        reason: String,
+        /// The captured backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// No profiling was registered
+    #[error("No profiling registered\nBacktrace:\n{backtrace}")]
+    NotRegistered {
+        /// The captured backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// A launch error happened during profiling
+    #[error("A launch error happened during profiling\nCaused by:\n  {0}")]
+    Launch(#[from] LaunchError),
+
+    /// An execution error happened during profiling
+    #[error("An execution error happened during profiling\nCaused by:\n  {0}")]
+    Server(#[from] Box<ServerError>),
+}
+
+impl core::fmt::Debug for ProfileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!("{self}"))
+    }
+}
+
+/// Contains many different types that are useful for server implementations and compute clients.
+pub struct ServerUtilities<Server: ComputeServer> {
+    /// The time when `profile-tracy` is activated.
+    #[cfg(feature = "profile-tracy")]
+    pub epoch_time: web_time::Instant,
+    /// The GPU client when `profile-tracy` is activated.
+    #[cfg(feature = "profile-tracy")]
+    pub gpu_client: tracy_client::GpuContext,
+    /// Information shared between all servers.
+    pub properties: DeviceProperties,
+    /// Stable hash of the device properties
+    pub properties_hash: u64,
+    /// Information specific to the current server.
+    pub info: Server::Info,
+    /// The logger based on global cubecl configs.
+    pub logger: Arc<ServerLogger>,
+    /// How to create the allocation.
+    pub layout_policy: Server::MemoryLayoutPolicy,
+    /// How to enforce bounds checking on kernels.
+    pub check_mode: BoundsCheckMode,
+    /// A set containing the ids for which the inter-device communication has already been initialized.
+    pub initialized_comms: RwLock<HashSet<CommunicationId>>,
+}
+
+/// Defines how the memory layout is determined.
+pub trait MemoryLayoutPolicy: Send + Sync + 'static {
+    /// Applies the memory layout policy to a list of descriptors.
+    ///
+    /// Returns a vector of `MemoryLayout`, one per descriptor, with layouts that share a
+    /// single `Binding`.
+    fn apply(
+        &self,
+        stream_id: StreamId,
+        descriptors: &[MemoryLayoutDescriptor],
+    ) -> (Handle, Vec<MemoryLayout>);
+}
+
+impl<Server: core::fmt::Debug> core::fmt::Debug for ServerUtilities<Server>
+where
+    Server: ComputeServer,
+    Server::Info: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.debug_struct("ServerUtilities")
+            .field("properties", &self.properties)
+            .field("info", &self.info)
+            .field("logger", &self.logger)
+            .finish()
+    }
+}
+
+impl<S: ComputeServer> ServerUtilities<S> {
+    /// Creates a new server utilities.
+    pub fn new(
+        properties: DeviceProperties,
+        logger: Arc<ServerLogger>,
+        info: S::Info,
+        allocator: S::MemoryLayoutPolicy,
+    ) -> Self {
+        // Start a tracy client if needed.
+        #[cfg(feature = "profile-tracy")]
+        let client = tracy_client::Client::start();
+
+        Self {
+            properties_hash: properties.checksum(),
+            properties,
+            logger,
+            // Create the GPU client if needed.
+            #[cfg(feature = "profile-tracy")]
+            gpu_client: client
+                .clone()
+                .new_gpu_context(
+                    Some(&format!("{info:?}")),
+                    // In the future should ask the server what makes sense here. 'Invalid' atm is a generic stand-in (Tracy doesn't have CUDA/RocM atm anyway).
+                    tracy_client::GpuContextType::Invalid,
+                    0,   // Timestamps are manually aligned to this epoch so start at 0.
+                    1.0, // Timestamps are manually converted to be nanoseconds so period is 1.
+                )
+                .unwrap(),
+            #[cfg(feature = "profile-tracy")]
+            epoch_time: web_time::Instant::now(),
+            info,
+            layout_policy: allocator,
+            check_mode: CubeClRuntimeConfig::get().compilation.check_mode,
+            initialized_comms: RwLock::new(HashSet::default()),
+        }
+    }
+}
+
+/// Kernel Launch Errors.
+#[derive(Error, Clone)]
+#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+pub enum LaunchError {
+    /// The given kernel can't be compiled.
+    #[error("A compilation error happened during launch\nCaused by:\n  {0}")]
+    CompilationError(#[from] CompilationError),
+
+    /// The server is out of memory.
+    #[error(
+        "An out-of-memory error happened during launch\nCaused by:\n  {reason}\nBacktrace\n{backtrace}"
+    )]
+    OutOfMemory {
+        /// The caused of the memory error.
+        reason: String,
+        /// The backtrace for this error.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// Too many resources were requested
+    #[error("Too many resources were requested during launch\n{0}")]
+    TooManyResources(#[from] ResourceLimitError),
+
+    /// Unknown launch error.
+    #[error(
+        "An unknown error happened during launch\nCaused by:\n  {reason}\nBacktrace\n{backtrace}"
+    )]
+    Unknown {
+        /// The caused of the unknown error.
+        reason: String,
+        /// The backtrace for this error.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// Can't launch because of an IO Error.
+    #[error("An io error happened during launch\nCaused by:\n  {0}")]
+    IoError(#[from] IoError),
+}
+
+/// Resource limit errors.
+#[derive(Error, Clone)]
+#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+pub enum ResourceLimitError {
+    /// Shared memory exceeds maximum
+    #[error(
+        "Too much shared memory requested.\nRequested {requested} bytes, maximum {max} bytes available.\nBacktrace\n{backtrace}"
+    )]
+    SharedMemory {
+        /// Value requested
+        requested: usize,
+        /// Maximum value
+        max: usize,
+        /// The backtrace for this error.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+    /// Total units exceeds maximum
+    #[error(
+        "Total unit count exceeds maximum.\nRequested {requested} units, max units is {max}.\nBacktrace\n{backtrace}"
+    )]
+    Units {
+        /// Requested value
+        requested: u32,
+        /// Maximum value
+        max: u32,
+        /// The backtrace for this error.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+    /// `CubeDim` exceeds maximum
+    #[error(
+        "Cube dim exceeds maximum bounds.\nRequested {requested:?}, max is {max:?}.\nBacktrace\n{backtrace}"
+    )]
+    CubeDim {
+        /// Requested value
+        requested: (u32, u32, u32),
+        /// Maximum value
+        max: (u32, u32, u32),
+        /// The backtrace for this error.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+}
+
+impl core::fmt::Debug for LaunchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!("{self}"))
+    }
+}
+
+impl core::fmt::Debug for ResourceLimitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!("{self}"))
+    }
+}
+
+/// Error that can happen asynchronously while executing registered kernels.
+#[derive(Error, Debug, Clone)]
+#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+pub enum ServerError {
+    /// A generic runtime error.
+    #[error("An error happened during execution\nCaused by:\n  {reason}\nBacktrace:\n{backtrace}")]
+    Generic {
+        /// The details of the generic error.
+        reason: String,
+        /// The backtrace for this error.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// A launch error happened during profiling
+    #[error("A launch error happened during profiling\nCaused by:\n  {0}")]
+    Launch(#[from] LaunchError),
+
+    /// An execution error happened during profiling
+    #[error("An execution error happened during profiling\nCaused by:\n  {0}")]
+    Profile(#[from] ProfileError),
+
+    /// An execution error happened during profiling
+    #[error("An execution error happened during profiling\nCaused by:\n  {0}")]
+    Io(#[from] IoError),
+
+    /// The server is an invalid state.
+    #[error("The server is in an invalid state\nCaused by:\n  {errors:?}")]
+    ServerUnhealthy {
+        /// The details of the generic error.
+        errors: Vec<Self>,
+        /// The backtrace for this error.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+}
+
+/// How errors are handled in a stream when executing a task.
+#[derive(Clone, Copy)]
+pub struct StreamErrorMode {
+    /// Whether the task still executes even if the stream is in error.
+    pub ignore: bool,
+    /// Whether the errors are flushed by the current task.
+    pub flush: bool,
+}
+
+/// The compute server is responsible for handling resources and computations over resources.
+///
+/// Everything in the server is mutable, therefore it should be solely accessed through the
+/// [`ComputeClient`] for thread safety.
+pub trait ComputeServer:
+    Send + core::fmt::Debug + ServerCommunication + device::DeviceService + 'static
+where
+    Self: Sized,
+{
+    /// The kernel type defines the computation algorithms.
+    type Kernel: KernelMetadata;
+    /// Information that can be retrieved for the runtime.
+    type Info: Debug + Send + Sync;
+    /// Manages how allocations are performed for a server.
+    type MemoryLayoutPolicy: MemoryLayoutPolicy;
+    /// The [storage](ComputeStorage) type defines how data is stored and accessed.
+    type Storage: ComputeStorage;
+
+    /// Initializes [memory](ManagedMemoryHandle) on the given [stream](StreamId) with the given size.
+    fn initialize_memory(&mut self, memory: ManagedMemoryHandle, size: u64, stream_id: StreamId);
+
+    /// Whether this backend can capture a region of enqueued work into a
+    /// replayable object at all. Callers must check this before capturing:
+    /// the capture methods below panic on a backend that cannot.
+    fn graph_capture_supported(&self) -> bool {
+        false
+    }
+
+    /// Defer the stream's pending-drop flush without opening a capture.
+    ///
+    /// This is the PRE-WARM for a capture, and it is needed because a capture
+    /// changes what the allocator has to hold at once. Normally a staging
+    /// buffer is handed back a few launches after it is used, so a region of
+    /// N launches only ever needs a handful of pages live. Inside a capture
+    /// nothing is handed back -- the flush waits on a fence, which a capture
+    /// cannot contain, and the buffers must stay alive anyway because the
+    /// graph re-reads them on every replay. So the region's requirement jumps
+    /// from its per-launch working set to its SIMULTANEOUS HIGH-WATER MARK,
+    /// and the pool discovers that by allocating, which is the one thing that
+    /// breaks a capture.
+    ///
+    /// Running the region once with frees deferred and no capture open lets
+    /// the pool reach that high-water mark the legal way. Flushing afterwards
+    /// returns the slices but keeps the pages, so the capture that follows
+    /// finds every page it needs already there.
+    fn graph_defer_frees(&mut self, _defer: bool, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Route every allocation on `stream_id` into the CAPTURE ARENA, and
+    /// return the generation this opening is.
+    ///
+    /// Call this once to WARM (arena open, no capture: the region runs eagerly
+    /// and the arena learns exactly which slices it needs), then again around
+    /// the capture itself. See
+    /// [`MemoryManagement::arena_begin`](crate::memory_management::MemoryManagement::arena_begin)
+    /// for why an arena and not a hold.
+    ///
+    /// Reopening the arena and capturing again DELIBERATELY hands the second
+    /// graph the same slices: that is what makes two captures of one region
+    /// comparable, and what lets one graph stand in for another step. The two
+    /// then share scratch, which is safe exactly when they are captures of the
+    /// same region -- checked by the request sequence each capture recorded --
+    /// and replayed serially, which the single stream gives for free.
+    fn graph_arena_begin(&mut self, _stream_id: StreamId) -> u64 {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Stop routing allocations into the arena. The arena keeps every page it
+    /// owns -- closing it ends allocation from it, never its reservation.
+    fn graph_arena_end(&mut self, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// What the arena holds, and how many requests it had to take from the
+    /// driver. A miss taken while a capture is open is a graph memory node.
+    fn graph_arena_stats(&mut self, _stream_id: StreamId) -> ArenaStats {
+        ArenaStats::default()
+    }
+
+    /// Zero the arena's served/miss counters so the capture pass can be
+    /// counted apart from the warm pass.
+    fn graph_arena_reset_counters(&mut self, _stream_id: StreamId) {}
+
+    /// What the allocator's RESERVE half costs, as `(calls, nanoseconds)`.
+    ///
+    /// A decode step makes roughly one reservation per kernel launch, and all
+    /// of it is host work inside the term a graph replay removes. The count has
+    /// been reported for a while; this is the time, because a count is not a
+    /// time and the two lead to opposite conclusions at 0.5 us and at 5 us a
+    /// request. Zero unless `CUBECL_TIME_RESERVE=1`. It does NOT include the
+    /// free half, which happens on handle drop.
+    fn reserve_timing(&mut self, _stream_id: StreamId) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// Zero the reservation timer.
+    fn reserve_timing_reset(&mut self, _stream_id: StreamId) {}
+
+    /// Begin capturing work enqueued on `stream_id` instead of running it.
+    /// Between this and [`ComputeServer::graph_capture_end`] nothing executes;
+    /// the enqueued work is recorded as a graph. Anything that BLOCKS THE HOST
+    /// on device progress inside the captured region (a sync, a fence wait, a
+    /// blocking read) invalidates the capture, because there is no device
+    /// progress to wait for.
+    fn graph_capture_begin(&mut self, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Close the capture opened by [`ComputeServer::graph_capture_begin`],
+    /// instantiate the result, and return an id naming it for replay. The
+    /// captured graph holds the EXACT device pointers seen during capture, so
+    /// every buffer it touches must live at a stable address across replays.
+    fn graph_capture_end(&mut self, _stream_id: StreamId) -> u64 {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Enqueue one replay of the graph named by `id` on `stream_id`.
+    fn graph_replay(&mut self, _id: u64, _stream_id: StreamId) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// 0 = not capturing, 1 = capturing, 2 = INVALIDATED, 3 = query failed.
+    /// A capture that has been invalidated keeps accepting work silently and
+    /// only reports it at `end`, so this is the only way to find WHICH call
+    /// broke one.
+    fn graph_capture_status(&mut self, _stream_id: StreamId) -> u32 {
+        3
+    }
+
+    /// How many nodes the captured graph holds. This is the unit the replay
+    /// cost is quoted per, so it belongs next to the graph, not in a log line.
+    fn graph_node_count(&mut self, _id: u64) -> usize {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// How many kernel launches the OPEN capture has recorded so far.
+    ///
+    /// This is the index a caller brackets its own calls with, so that after
+    /// the capture closes it can name the nodes a particular call produced
+    /// without knowing anything about how many kernels that call fans out to.
+    /// It counts launches, not nodes: a launch is one node, but a graph also
+    /// holds memcpy and memset nodes that no launch made.
+    fn graph_capture_launch_count(&mut self) -> usize {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// How many launches the closed graph `id` recorded.
+    fn graph_launch_count(&mut self, _id: u64) -> usize {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// What launch `idx` of graph `id` was recorded WITH: its grid, its packed
+    /// scalar+metadata blob, and the device address of every buffer it bound.
+    ///
+    /// This is the half of patching that makes it checkable. A caller that
+    /// wants to move a scalar has to know which slot of the blob holds it, and
+    /// the honest way to learn that is to look at what the blob actually
+    /// contained when the value was known -- not to re-derive cubecl's packing
+    /// order by hand and hope.
+    fn graph_launch_params(&mut self, _id: u64, _idx: usize) -> GraphLaunchParams {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Rewrite launch `idx` of graph `id`'s EXECUTABLE in place.
+    ///
+    /// The graph is untouched; only the instantiated exec changes, which is
+    /// what makes this cheap enough to do per step. Everything not named in
+    /// `patch` keeps the value it was captured with.
+    fn graph_patch_launch(&mut self, _id: u64, _idx: usize, _patch: GraphLaunchPatch) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// A census of the graph's nodes by KIND, as `(CUgraphNodeType, count)`.
+    ///
+    /// A graph is not only its kernels. Everything else a capture recorded --
+    /// host-to-device copies, memsets, child graphs -- is a node too, and a
+    /// node no kernel-parameter rewrite can reach. Whether a region is
+    /// replayable on a later step is therefore first of all a question about
+    /// how much of it is NOT a kernel launch.
+    fn graph_node_kinds(&mut self, _id: u64) -> Vec<(u32, usize)> {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Rewrite several launches of one graph in a single round trip.
+    ///
+    /// Per-launch [`ComputeServer::graph_patch_launch`] is one submit each, and
+    /// on a region with a hundred moving launches the submits cost far more
+    /// than the rewrites do. The batch exists because that overhead is the
+    /// caller's to avoid, not something to measure and report as the price of
+    /// patching.
+    fn graph_patch_launches(&mut self, _id: u64, _patches: Vec<(usize, GraphLaunchPatch)>) {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Every `(address, bytes)` the graph ALLOCATES for itself.
+    ///
+    /// A capture that could not avoid allocating turns each allocation into a
+    /// memory node, and the memory a graph owns has a virtual address the graph
+    /// fixes -- the same one on every launch of that exec, and NOT the same one
+    /// as any other graph's. So these addresses are already pinned for as long
+    /// as one exec is being replayed, and rewriting them to another graph's is
+    /// wrong by construction rather than merely unnecessary. A caller
+    /// re-pointing a region's buffers has to be able to tell them apart from
+    /// the ones that came from the pool.
+    fn graph_alloc_regions(&mut self, _id: u64) -> Vec<(u64, u64)> {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Every memcpy node's `(src, dst, bytes, kind)`, sorted.
+    ///
+    /// A capture records copies as well as launches, and a copy is not a
+    /// kernel: no parameter rewrite reaches it. When the data a copy carries is
+    /// per-step, the region is not replayable on a later step no matter how
+    /// well its kernels are patched, and this is how that is checked rather
+    /// than assumed.
+    fn graph_memcpy_specs(&mut self, _id: u64) -> Vec<(u64, u64, u64, u32)> {
+        panic!("graph capture is not supported by this backend");
+    }
+
+    /// Release a captured graph. An unknown id is ignored.
+    fn graph_destroy(&mut self, _id: u64) {}
+
+    /// Register an externally-owned GPU buffer that ALIASES host memory (e.g.
+    /// mmap'd pile pages) as a tensor [`Handle`], with ZERO copy. `ptr`/`page_len`
+    /// describe a page-aligned superset region (required by Metal's
+    /// `newBufferWithBytesNoCopy:`); `offset`/`size` locate the actual tensor
+    /// bytes inside it. The caller guarantees the host memory outlives every
+    /// handle derived from it. Default impl panics — only backends that can
+    /// import host buffers (wgpu/Metal) override this.
+    fn register_external_aliased(
+        &mut self,
+        _ptr: *mut core::ffi::c_void,
+        _page_len: u64,
+        _offset: u64,
+        _size: u64,
+        _keepalive: alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
+        _stream_id: StreamId,
+    ) -> Handle {
+        panic!("register_external_aliased is not supported by this backend");
+    }
+
+    /// Reserves N [Bytes] of the provided sizes to be used as staging to load data.
+    fn staging(
+        &mut self,
+        _sizes: &[usize],
+        _stream_id: StreamId,
+    ) -> Result<Vec<Bytes>, ServerError> {
+        Err(IoError::UnsupportedIoOperation {
+            backtrace: BackTrace::capture(),
+        }
+        .into())
+    }
+
+    /// Retrieve the server logger.
+    fn logger(&self) -> Arc<ServerLogger>;
+
+    /// Retrieve the server utilities.
+    fn utilities(&self) -> Arc<ServerUtilities<Self>>;
+
+    /// Given bindings, returns the owned resources as bytes.
+    fn read(
+        &mut self,
+        descriptors: Vec<CopyDescriptor>,
+        stream_id: StreamId,
+    ) -> DynFut<Result<Vec<Bytes>, ServerError>>;
+
+    /// Writes the specified bytes into the buffers given
+    fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId);
+
+    /// Wait for the completion of every task in the server.
+    fn sync(&mut self, stream_id: StreamId) -> DynFut<Result<(), ServerError>>;
+
+    /// Given a resource handle, returns the storage resource.
+    fn get_resource(
+        &mut self,
+        binding: Binding,
+        stream_id: StreamId,
+    ) -> Result<ManagedResource<<Self::Storage as ComputeStorage>::Resource>, ServerError>;
+
+    /// Executes the `kernel` over the given memory `handles`.
+    ///
+    /// Kernels have mutable access to every resource they are given
+    /// and are responsible of determining which should be read or written.
+    ///
+    /// # Safety
+    ///
+    /// When executing with mode [`ExecutionMode::Unchecked`], out-of-bound reads and writes can happen.
+    unsafe fn launch(
+        &mut self,
+        kernel: Self::Kernel,
+        count: CubeCount,
+        bindings: KernelArguments,
+        kind: ExecutionMode,
+        stream_id: StreamId,
+    );
+
+    /// Flush all outstanding tasks in the server.
+    fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError>;
+
+    /// The current memory usage of the server.
+    fn memory_usage(&mut self, stream_id: StreamId) -> Result<MemoryUsage, ServerError>;
+
+    /// Ask the server to release memory that it can release.
+    fn memory_cleanup(&mut self, stream_id: StreamId);
+
+    /// Enable collecting timestamps.
+    fn start_profile(&mut self, stream_id: StreamId) -> Result<ProfilingToken, ServerError>;
+
+    /// Disable collecting timestamps.
+    fn end_profile(
+        &mut self,
+        stream_id: StreamId,
+        token: ProfilingToken,
+    ) -> Result<ProfileDuration, ProfileError>;
+
+    /// Update the memory mode of allocation in the server.
+    fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId);
+}
+
+/// An ID unique to any unordered combination of devices.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct CommunicationId {
+    /// The ID as a `String`.
+    pub id: u64,
+}
+
+impl From<Vec<DeviceId>> for CommunicationId {
+    fn from(mut value: Vec<DeviceId>) -> Self {
+        // Make sure that device ids are sorted so that any combination of the same devices uses the same communicator.
+        value.sort();
+        let mut hasher = AHasher::default();
+        value.hash(&mut hasher);
+        CommunicationId {
+            id: hasher.finish(),
+        }
+    }
+}
+
+/// Different reduce operations.
+pub enum ReduceOperation {
+    /// Sum.
+    Sum,
+    /// Mean.
+    Mean,
+}
+
+/// Defines functions for optimized data transfer between servers, supporting custom communication
+/// mechanisms such as peer-to-peer communication or specialized implementations.
+pub trait ServerCommunication {
+    /// Indicates whether server-to-server communication is enabled for this implementation.
+    const SERVER_COMM_ENABLED: bool;
+
+    /// Ensure that all queued collective operations have been executed.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - The [`StreamId`] of the stream waiting for the sync.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing an `ServerError` if the operation fails.
+    #[allow(unused_variables)]
+    fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
+        todo!() // For backends other than cuda.
+    }
+
+    /// Initialize the communication between the devices in `device_ids`.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_ids` - The IDs of the devices that need communication.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing an `ServerError` if the operation fails.
+    #[allow(unused_variables)]
+    fn comm_init(&mut self, device_ids: Vec<DeviceId>) -> Result<(), ServerError> {
+        unimplemented!()
+    }
+
+    /// Performs an `all_reduce` operation on the input data and writes it to the output buffer.
+    /// see <https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allreduce>
+    ///
+    /// # Arguments
+    ///
+    /// * `src` - The data to be reduced.
+    /// * `dst` - Where to write the result.
+    /// * `dtype` - The element type of the data being reduced
+    /// * `stream_id` - The data's stream id.
+    /// * `op` - The reduce's aggregation operation e.g. mean, sum, etc.
+    /// * `device_ids` - The list of device ids from which to `all_reduce`.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing an `ServerError` if the operation fails.
+    #[allow(unused_variables)]
+    fn all_reduce(
+        &mut self,
+        src: Binding,
+        dst: Binding,
+        dtype: ElemType,
+        stream_id: StreamId,
+        op: ReduceOperation,
+        device_ids: Vec<DeviceId>,
+    ) -> Result<(), ServerError> {
+        unimplemented!()
+    }
+
+    /// Sends data from this server to a destination server.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - A descriptor specifying the data to be sent, including shape, strides, and binding.
+    /// * `dtype` - The element type of the data being sent.
+    /// * `stream_id` - The stream ID associated with the server's operation.
+    /// * `device_id_dst` - ID of the device receiving the data.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing an `ServerError` if the operation fails.
+    #[allow(unused_variables)]
+    fn send(
+        &mut self,
+        desc: CopyDescriptor,
+        dtype: ElemType,
+        stream_id: StreamId,
+        device_id_dst: DeviceId,
+    ) -> Result<(), ServerError> {
+        unimplemented!()
+    }
+
+    /// Receive data from another server.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The handle in which the received data is written.
+    /// * `dtype` - The element type of the data being sent.
+    /// * `stream_id` - The stream ID associated with the server's operation.
+    /// * `device_id_src` - ID of the device sending the data.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing an `ServerError` if the operation fails.
+    #[allow(unused_variables)]
+    fn recv(
+        &mut self,
+        handle: Handle,
+        dtype: ElemType,
+        stream_id: StreamId,
+        device_id_src: DeviceId,
+    ) -> Result<(), ServerError> {
+        unimplemented!()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+/// Profiling identification so that the server can support recursive and overlapping profilings.
+pub struct ProfilingToken {
+    /// The token value.
+    pub id: u64,
+}
+
+/// Type of allocation, either contiguous or optimized (row-aligned when possible)
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum MemoryLayoutStrategy {
+    /// Contiguous layout, with no padding
+    Contiguous,
+    /// Optimized for access speed. In practice this means row-aligned with padding for runtimes
+    /// that support it.
+    Optimized,
+}
+
+/// Descriptor for a new tensor allocation
+#[derive(new, Debug, Clone)]
+pub struct MemoryLayoutDescriptor {
+    /// Strategy used to create the memory layout.
+    pub strategy: MemoryLayoutStrategy,
+    /// Shape of the tensor
+    pub shape: Shape,
+    /// Size of each element in the tensor (used for conversion of shape to bytes)
+    pub elem_size: usize,
+}
+
+impl MemoryLayoutDescriptor {
+    /// Create an optimized allocation descriptor
+    pub fn optimized(shape: Shape, elem_size: usize) -> Self {
+        MemoryLayoutDescriptor::new(MemoryLayoutStrategy::Optimized, shape, elem_size)
+    }
+
+    /// Create a contiguous allocation descriptor
+    pub fn contiguous(shape: Shape, elem_size: usize) -> Self {
+        MemoryLayoutDescriptor::new(MemoryLayoutStrategy::Contiguous, shape, elem_size)
+    }
+}
+
+/// An allocation with associated strides. Strides depend on tensor layout.
+#[derive(Debug, Clone)]
+pub struct MemoryLayout {
+    /// The handle for the memory resource
+    pub memory: Handle,
+    /// TODO: `Strides` should become `Layout`.
+    ///
+    /// The strides of the tensor
+    pub strides: Strides,
+}
+
+impl MemoryLayout {
+    /// Create a new memory layout.
+    pub fn new(handle: Handle, strides: impl Into<Strides>) -> Self {
+        MemoryLayout {
+            memory: handle,
+            strides: strides.into(),
+        }
+    }
+}
+
+/// A reason for an error.
+#[derive(Default, Clone)]
+pub struct Reason {
+    inner: ReasonInner,
+}
+
+#[cfg(std_io)]
+mod _reason_serde {
+    use super::*;
+
+    use alloc::string::ToString;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    impl Serialize for Reason {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            // Use the Display implementation (via to_string) to flatten the enum
+            serializer.serialize_str(&self.to_string())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Reason {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            // Deserialize into a standard String first
+            let s = String::deserialize(deserializer)?;
+
+            // Wrap it in the Dynamic variant since we can't safely
+            // reconstruct a 'static str from a runtime string.
+            Ok(Reason {
+                inner: ReasonInner::Dynamic(Arc::new(s)),
+            })
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+enum ReasonInner {
+    Static(&'static str),
+    Dynamic(Arc<String>),
+    #[default]
+    NotProvided,
+}
+
+impl core::fmt::Display for Reason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.inner {
+            ReasonInner::Static(content) => f.write_str(content),
+            ReasonInner::Dynamic(content) => f.write_str(content),
+            ReasonInner::NotProvided => f.write_str("No reason provided for the error"),
+        }
+    }
+}
+
+impl core::fmt::Debug for Reason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self, f)
+    }
+}
+
+impl From<&'static str> for Reason {
+    fn from(value: &'static str) -> Self {
+        Self {
+            inner: ReasonInner::Static(value),
+        }
+    }
+}
+
+impl From<String> for Reason {
+    fn from(value: String) -> Self {
+        Self {
+            inner: ReasonInner::Dynamic(Arc::new(value)),
+        }
+    }
+}
+
+/// Error returned from `create`/`read`/`write` functions. Due to async execution not all errors
+/// are able to be caught, so some IO errors will still panic.
+#[derive(Error, Clone)]
+#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+pub enum IoError {
+    /// Buffer size exceeds the max available
+    #[error("can't allocate buffer of size: {size}\n{backtrace}")]
+    BufferTooBig {
+        /// The size of the buffer in bytes.
+        size: u64,
+        /// The captured backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// Strides aren't supported for this copy operation on this runtime
+    #[error("the provided strides are not supported for this operation\n{backtrace}")]
+    UnsupportedStrides {
+        /// The backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// Memory wasn't found in the memory pool
+    #[error("couldn't find resource for that handle: {reason}\n{backtrace}")]
+    NotFound {
+        /// The backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+        /// The reason the handle is invalid.
+        reason: Reason,
+    },
+
+    /// Handle wasn't found in the memory pool
+    #[error("couldn't free the handle, since it is currently in used. \n{backtrace}")]
+    FreeError {
+        /// The backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// Unknown error happened during execution
+    #[error("Unknown error happened during execution\n{backtrace}")]
+    Unknown {
+        /// Details of the error
+        description: String,
+        /// The backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// The current IO operation is not supported
+    #[error("The current IO operation is not supported\n{backtrace}")]
+    UnsupportedIoOperation {
+        /// The backtrace.
+        #[cfg_attr(std_io, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// Can't perform the IO operation because of a runtime error.
+    #[error("Can't perform the IO operation because of a runtime error: {0}")]
+    Execution(#[from] Box<ServerError>),
+}
+
+impl core::fmt::Debug for IoError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!("{self}"))
+    }
+}
+
+/// Arguments to execute a kernel.
+#[derive(Debug, Default)]
+pub struct KernelArguments {
+    /// Buffer bindings
+    pub buffers: Vec<Binding>,
+    /// Packed scalars and metadata. First scalars sorted by type, then static metadata,
+    /// then dynamic metadata.
+    pub info: MetadataBindingInfo,
+    /// Tensor map bindings
+    pub tensor_maps: Vec<TensorMapBinding>,
+}
+
+impl core::fmt::Display for KernelArguments {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("KernelArguments")?;
+        for b in self.buffers.iter() {
+            f.write_fmt(format_args!("\n - buffer: {b:?}\n"))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl KernelArguments {
+    /// Create a new bindings struct
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a buffer binding
+    pub fn with_buffer(mut self, binding: Binding) -> Self {
+        self.buffers.push(binding);
+        self
+    }
+
+    /// Extend the buffers with `bindings`
+    pub fn with_buffers(mut self, bindings: Vec<Binding>) -> Self {
+        self.buffers.extend(bindings);
+        self
+    }
+
+    /// Set the info to `info`
+    pub fn with_info(mut self, info: MetadataBindingInfo) -> Self {
+        self.info = info;
+        self
+    }
+
+    /// Extend the tensor maps with `bindings`
+    pub fn with_tensor_maps(mut self, bindings: Vec<TensorMapBinding>) -> Self {
+        self.tensor_maps.extend(bindings);
+        self
+    }
+}
+
+/// Binding of a set of scalars of the same type to execute a kernel.
+///
+/// The [`ComputeServer`] is responsible to convert those info into actual [`Binding`] when launching
+/// kernels.
+#[derive(new, Debug, Default)]
+pub struct MetadataBindingInfo {
+    /// Scalar and metadata values
+    pub data: Vec<u64>,
+    /// Start of the dynamically sized portion of the metadata, relative to the entire info buffer
+    pub dynamic_metadata_offset: usize,
+}
+
+impl MetadataBindingInfo {
+    /// Create a new binding info for custom data, for externally compiled kernels.
+    pub fn custom(data: Vec<u64>) -> Self {
+        Self::new(data, 0)
+    }
+}
+
+/// A binding with shape and stride info for non-contiguous reading
+#[derive(new, Debug)]
+pub struct CopyDescriptor {
+    /// Binding for the memory resource
+    pub handle: Binding,
+    /// Shape of the resource
+    pub shape: Shape,
+    /// Strides of the resource
+    pub strides: Strides,
+    /// Size of each element in the resource
+    pub elem_size: usize,
+}
+
+/// A tensor map used with TMA ops
+#[derive(new, Debug)]
+pub struct TensorMapBinding {
+    /// The binding for the backing tensor
+    pub binding: Binding,
+    /// The tensormap metadata
+    pub map: TensorMapMeta,
+}
+
+/// `TensorMap` metadata for the opaque proxy used in TMA copies
+#[derive(Debug, Clone)]
+pub struct TensorMapMeta {
+    /// Tensormap format (tiled or im2col)
+    pub format: TensorMapFormat,
+    /// Metadata of the backing tensor
+    pub metadata: Metadata,
+    /// Element stride, usually 1 but may be 2 for complex tensors
+    /// For im2col, this is equivalent to the kernel stride
+    pub elem_stride: Strides,
+    /// Interleave mode
+    pub interleave: TensorMapInterleave,
+    /// Swizzle mode
+    pub swizzle: TensorMapSwizzle,
+    /// Prefetch settings
+    pub prefetch: TensorMapPrefetch,
+    /// OOB fill value
+    pub oob_fill: OobFill,
+    /// Storage type
+    pub storage_ty: StorageType,
+}
+
+/// Specifieds the number of cubes to be dispatched for a kernel.
+///
+/// This translates to eg. a grid for CUDA, or to `num_workgroups` for wgsl.
+#[allow(clippy::large_enum_variant)]
+pub enum CubeCount {
+    /// Dispatch a known count of x, y, z cubes.
+    Static(u32, u32, u32),
+    /// Dispatch an amount based on the values in this buffer. The buffer should contain a u32 array [x, y, z].
+    Dynamic(Binding),
+}
+
+/// Defines how to select cube count based on the number of cubes required.
+pub enum CubeCountSelection {
+    /// If the number of cubes is the same as required.
+    Exact(CubeCount),
+    /// If the number of cubes isn't the same as required.
+    ///
+    /// This can happen based on the hardware limit, requiring the kernel to perform OOB checks.
+    Approx(CubeCount, u32),
+}
+
+impl CubeCountSelection {
+    /// Creates a [`CubeCount`] while respecting the hardware limits.
+    pub fn new<R: Runtime>(client: &ComputeClient<R>, num_cubes: u32) -> Self {
+        let cube_count = cube_count_spread(&client.properties().hardware.max_cube_count, num_cubes);
+
+        let num_cubes_actual = cube_count[0] * cube_count[1] * cube_count[2];
+        let cube_count = CubeCount::Static(cube_count[0], cube_count[1], cube_count[2]);
+
+        match num_cubes_actual == num_cubes {
+            true => CubeCountSelection::Exact(cube_count),
+            false => CubeCountSelection::Approx(cube_count, num_cubes_actual),
+        }
+    }
+
+    /// If some cubes will be idle.
+    pub fn has_idle(&self) -> bool {
+        matches!(self, Self::Approx(..))
+    }
+
+    /// Converts into [`CubeCount`].
+    pub fn cube_count(self) -> CubeCount {
+        match self {
+            CubeCountSelection::Exact(cube_count) => cube_count,
+            CubeCountSelection::Approx(cube_count, _) => cube_count,
+        }
+    }
+}
+
+impl From<CubeCountSelection> for CubeCount {
+    fn from(value: CubeCountSelection) -> Self {
+        value.cube_count()
+    }
+}
+
+impl CubeCount {
+    /// Create a new static cube count with the given x = y = z = 1.
+    pub fn new_single() -> Self {
+        CubeCount::Static(1, 1, 1)
+    }
+
+    /// Create a new static cube count with the given x, and y = z = 1.
+    pub fn new_1d(x: u32) -> Self {
+        CubeCount::Static(x, 1, 1)
+    }
+
+    /// Create a new static cube count with the given x and y, and z = 1.
+    pub fn new_2d(x: u32, y: u32) -> Self {
+        CubeCount::Static(x, y, 1)
+    }
+
+    /// Create a new static cube count with the given x, y and z.
+    pub fn new_3d(x: u32, y: u32, z: u32) -> Self {
+        CubeCount::Static(x, y, z)
+    }
+
+    /// Checks whether the cube count is definitely empty, i.e. has 0 dispatches.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Static(x, y, z) => *x == 0 || *y == 0 || *z == 0,
+            Self::Dynamic(_) => false,
+        }
+    }
+}
+
+impl Debug for CubeCount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CubeCount::Static(x, y, z) => f.write_fmt(format_args!("({x}, {y}, {z})")),
+            CubeCount::Dynamic(_) => f.write_str("binding"),
+        }
+    }
+}
+
+impl Clone for CubeCount {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Static(x, y, z) => Self::Static(*x, *y, *z),
+            Self::Dynamic(binding) => Self::Dynamic(binding.clone()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[allow(missing_docs)]
+/// The number of units across all 3 axis totalling to the number of working units in a cube.
+pub struct CubeDim {
+    /// The number of units in the x axis.
+    pub x: u32,
+    /// The number of units in the y axis.
+    pub y: u32,
+    /// The number of units in the z axis.
+    pub z: u32,
+}
+
+impl CubeDim {
+    /// Creates a new [`CubeDim`] based on the maximum number of tasks that can be parellalized by units, in other words,
+    /// by the maximum number of working units.
+    ///
+    /// # Notes
+    ///
+    /// For complex problems, you probably want to have your own logic function to create the
+    /// [`CubeDim`], but for simpler problems such as elemwise-operation, this is a great default.
+    pub fn new<R: Runtime>(client: &ComputeClient<R>, working_units: usize) -> Self {
+        let properties = client.properties();
+        let plane_size = properties.hardware.plane_size_max;
+        let plane_count = Self::calculate_plane_count_per_cube(
+            working_units as u32,
+            plane_size,
+            properties.hardware.num_cpu_cores,
+        );
+
+        // Make sure it respects the max units per cube (especially on wasm)
+        let limit = properties.hardware.max_units_per_cube / plane_size;
+
+        // Ensure at least 1 plane so CubeDim is always valid (num_elems() > 0).
+        Self::new_2d(plane_size, u32::min(limit, plane_count).max(1))
+    }
+
+    fn calculate_plane_count_per_cube(
+        working_units: u32,
+        plane_dim: u32,
+        num_cpu_cores: Option<u32>,
+    ) -> u32 {
+        match num_cpu_cores {
+            Some(num_cores) => core::cmp::min(num_cores, working_units),
+            None => {
+                let plane_count_max = core::cmp::max(1, working_units / plane_dim);
+
+                // Ensures `plane_count` is a power of 2.
+                const NUM_PLANE_MAX: u32 = 8u32;
+                const NUM_PLANE_MAX_LOG2: u32 = NUM_PLANE_MAX.ilog2();
+                let plane_count_max_log2 =
+                    core::cmp::min(NUM_PLANE_MAX_LOG2, u32::ilog2(plane_count_max));
+                2u32.pow(plane_count_max_log2)
+            }
+        }
+    }
+
+    /// Create a new cube dim with x = y = z = 1.
+    pub const fn new_single() -> Self {
+        Self { x: 1, y: 1, z: 1 }
+    }
+
+    /// Create a new cube dim with the given x, and y = z = 1.
+    pub const fn new_1d(x: u32) -> Self {
+        Self { x, y: 1, z: 1 }
+    }
+
+    /// Create a new cube dim with the given x and y, and z = 1.
+    pub const fn new_2d(x: u32, y: u32) -> Self {
+        Self { x, y, z: 1 }
+    }
+
+    /// Create a new cube dim with the given x, y and z.
+    /// This is equivalent to the [new](CubeDim::new) function.
+    pub const fn new_3d(x: u32, y: u32, z: u32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Total numbers of units per cube
+    pub const fn num_elems(&self) -> u32 {
+        self.x * self.y * self.z
+    }
+
+    /// Whether this `CubeDim` can fully contain `other`
+    pub const fn can_contain(&self, other: CubeDim) -> bool {
+        self.x >= other.x && self.y >= other.y && self.z >= other.z
+    }
+}
+
+impl From<(u32, u32, u32)> for CubeDim {
+    fn from(value: (u32, u32, u32)) -> Self {
+        CubeDim::new_3d(value.0, value.1, value.2)
+    }
+}
+
+impl From<CubeDim> for (u32, u32, u32) {
+    fn from(val: CubeDim) -> Self {
+        (val.x, val.y, val.z)
+    }
+}
+
+/// The kind of execution to be performed.
+#[derive(Default, Hash, PartialEq, Eq, Clone, Debug, Copy)]
+#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+pub enum ExecutionMode {
+    /// Checked kernels are safe.
+    #[default]
+    Checked,
+    /// Validate OOB and alert if OOB access occurs
+    Validate,
+    /// Unchecked kernels are unsafe.
+    Unchecked,
+}
+
+fn cube_count_spread(max: &(u32, u32, u32), num_cubes: u32) -> [u32; 3] {
+    let max_cube_counts = [max.0, max.1, max.2];
+    let mut num_cubes = [num_cubes, 1, 1];
+    let base = 2;
+
+    let mut reduce_count = |i: usize| {
+        if num_cubes[i] <= max_cube_counts[i] {
+            return true;
+        }
+
+        loop {
+            num_cubes[i] = num_cubes[i].div_ceil(base);
+            num_cubes[i + 1] *= base;
+
+            if num_cubes[i] <= max_cube_counts[i] {
+                return false;
+            }
+        }
+    };
+
+    for i in 0..2 {
+        if reduce_count(i) {
+            break;
+        }
+    }
+
+    num_cubes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_log::test]
+    fn safe_num_cubes_even() {
+        let max = (32, 32, 32);
+        let required = 2048;
+
+        let actual = cube_count_spread(&max, required);
+        let expected = [32, 32, 2];
+        assert_eq!(actual, expected);
+    }
+
+    #[test_log::test]
+    fn safe_num_cubes_odd() {
+        let max = (48, 32, 16);
+        let required = 3177;
+
+        let actual = cube_count_spread(&max, required);
+        let expected = [25, 32, 4];
+        assert_eq!(actual, expected);
+    }
+}
+
+/// What one captured launch was recorded with.
+///
+/// `info` is cubecl's packed argument blob -- scalars first, sorted by type,
+/// then static metadata, then dynamic metadata -- exactly as the launch
+/// presented it. `ptrs` are the device addresses the launch bound, in binding
+/// order. Both are the values baked into the graph node, which is why reading
+/// them back is the only sound way to locate a value inside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphLaunchParams {
+    /// The cube count the launch was recorded with.
+    pub grid: (u32, u32, u32),
+    /// The cube dim the launch was recorded with.
+    pub block: (u32, u32, u32),
+    /// The packed scalar and metadata blob, as captured.
+    pub info: Vec<u64>,
+    /// Whether `info` reached the kernel as a by-value grid constant. When it
+    /// did not, it lives in a device buffer instead and no parameter rewrite
+    /// can move it.
+    pub info_is_grid_constant: bool,
+    /// The device address of every buffer the launch bound, in binding order.
+    pub ptrs: Vec<u64>,
+    /// Where the DYNAMIC half of `info` starts.
+    ///
+    /// `info[..dyn_offset]` is the scalars and the static metadata and reaches
+    /// the kernel BY VALUE, so a parameter rewrite moves it.
+    /// `info[dyn_offset..]` is every bound tensor's shape and stride list; it
+    /// is variable-length, so it cannot be a fixed-size kernel parameter and
+    /// is uploaded by a memcpy node instead. A word that moved between two
+    /// captures is patchable or staged according to which side of this it
+    /// falls on, and reporting the two as one number says neither.
+    pub dyn_offset: usize,
+    /// Whether the launch has a pinned staging buffer the graph owns, i.e.
+    /// whether its dynamic half can be rewritten at all.
+    pub has_staging: bool,
+    /// The kernel, named. Populated only for launches recorded by a capture.
+    pub name: String,
+}
+
+/// What to change about one captured launch. Fields left `None`/empty keep the
+/// captured value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphLaunchPatch {
+    /// A new cube count. This is what moves a launch whose GEOMETRY depends on
+    /// a per-step quantity, such as an attention split count that grows with
+    /// the context.
+    pub grid: Option<(u32, u32, u32)>,
+    /// A new packed argument blob. Must be the same length as the captured
+    /// one: the kernel's parameter size is fixed at compile time and a shorter
+    /// blob would have the driver read past it.
+    pub info: Option<Vec<u64>>,
+    /// `(binding index, new device address)` for buffers that must be
+    /// re-pointed. Empty is the normal case and the one the design is for --
+    /// a region whose buffers are pinned patches scalars only.
+    pub ptrs: Vec<(usize, u64)>,
+}

@@ -1,0 +1,153 @@
+use cubecl_core::server::IoError;
+use cubecl_runtime::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
+use hashbrown::HashMap;
+use std::num::NonZeroU64;
+use wgpu::BufferUsages;
+
+/// Minimum buffer size in bytes. The WebGPU spec requires buffer sizes > 0, and shaders
+/// declare typed arrays (e.g. `array<vec4<f32>>`) that impose a minimum binding size.
+/// 32 bytes covers the largest possible binding type (`vec4<f64>`).
+const MIN_BUFFER_SIZE: u64 = 32;
+
+/// Buffer storage for wgpu.
+pub struct WgpuStorage {
+    memory: HashMap<StorageId, wgpu::Buffer>,
+    /// Keep-alive anchors for externally-registered (aliasing) buffers: the
+    /// backing each aliases — e.g. an `anybytes` mmap owner — kept alive exactly
+    /// as long as the buffer, then dropped on `dealloc`. So an aliased buffer
+    /// *carries* its backing; nothing upstream has to manage that lifetime.
+    external_keepalives: HashMap<StorageId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    device: wgpu::Device,
+    buffer_usages: BufferUsages,
+    mem_alignment: usize,
+}
+
+impl core::fmt::Debug for WgpuStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(format!("WgpuStorage {{ device: {:?} }}", self.device).as_str())
+    }
+}
+
+/// The memory resource that can be allocated for wgpu.
+#[derive(new, Debug)]
+pub struct WgpuResource {
+    /// The wgpu buffer.
+    pub buffer: wgpu::Buffer,
+    /// The buffer offset.
+    pub offset: u64,
+    /// The size of the resource.
+    ///
+    /// # Notes
+    ///
+    /// The result considers the offset.
+    pub size: u64,
+}
+
+impl WgpuResource {
+    /// Return the binding view of the buffer.
+    pub fn as_wgpu_bind_resource(&self) -> wgpu::BindingResource<'_> {
+        // wgpu enforces 4-byte alignment for buffer binding sizes per the WebGPU spec.
+        // - https://github.com/gfx-rs/wgpu/pull/8041
+        //
+        // This padding is safe because:
+        // 1. In checked mode, bounds checks prevent reading beyond the logical size.
+        // 2. In unchecked mode, OOB access is already undefined behavior.
+        //
+        // For zero-sized resources, pass None (use rest of buffer from offset).
+        // The allocator guarantees the buffer is at least MIN_BUFFER_SIZE bytes.
+        let size = NonZeroU64::new(self.size.next_multiple_of(4));
+
+        let binding = wgpu::BufferBinding {
+            buffer: &self.buffer,
+            offset: self.offset,
+            size,
+        };
+        wgpu::BindingResource::Buffer(binding)
+    }
+}
+
+/// Keeps actual wgpu buffer references in a hashmap with ids as key.
+impl WgpuStorage {
+    /// Create a new storage on the given [device](wgpu::Device).
+    pub fn new(mem_alignment: usize, device: wgpu::Device, usages: BufferUsages) -> Self {
+        Self {
+            memory: HashMap::new(),
+            external_keepalives: HashMap::new(),
+            device,
+            buffer_usages: usages,
+            mem_alignment,
+        }
+    }
+
+    /// Register an externally-created [`wgpu::Buffer`] (e.g. one built via
+    /// `create_buffer_from_hal` over a Metal `newBufferWithBytesNoCopy:` that
+    /// aliases mmap'd host memory) and return a [`StorageHandle`] addressing it —
+    /// WITHOUT allocating. The buffer is owned by this storage from here on (it
+    /// lives in the same `memory` map and is freed on `dealloc`). Pairs with
+    /// `MemoryManagement::register_external` for zero-copy weight loading.
+    pub fn register_external(
+        &mut self,
+        buffer: wgpu::Buffer,
+        offset: u64,
+        size: u64,
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> StorageHandle {
+        let id = StorageId::new();
+        self.memory.insert(id, buffer);
+        self.external_keepalives.insert(id, keepalive);
+        StorageHandle::new(id, StorageUtilization { offset, size })
+    }
+
+    /// Borrow the underlying wgpu device — needed to build the external buffer
+    /// (via `create_buffer_from_hal`) before handing it to `register_external`.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+}
+
+impl ComputeStorage for WgpuStorage {
+    type Resource = WgpuResource;
+
+    fn alignment(&self) -> usize {
+        self.mem_alignment
+    }
+
+    fn get(&mut self, handle: &StorageHandle) -> Self::Resource {
+        let buffer = self.memory.get(&handle.id).unwrap();
+        WgpuResource::new(buffer.clone(), handle.offset(), handle.size())
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "trace", skip(self, size))
+    )]
+    fn alloc(&mut self, size: u64) -> Result<StorageHandle, IoError> {
+        let id = StorageId::new();
+
+        let alloc_size = size.max(MIN_BUFFER_SIZE);
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: alloc_size,
+            usage: self.buffer_usages,
+            mapped_at_creation: false,
+        });
+
+        self.memory.insert(id, buffer);
+        Ok(StorageHandle::new(
+            id,
+            StorageUtilization { offset: 0, size },
+        ))
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
+    fn dealloc(&mut self, id: StorageId) {
+        self.memory.remove(&id);
+        // Releasing the buffer releases its aliased backing (e.g. the mmap owner).
+        self.external_keepalives.remove(&id);
+    }
+
+    fn flush(&mut self) {
+        // We don't wait for dealloc
+    }
+}
