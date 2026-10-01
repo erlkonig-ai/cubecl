@@ -1,3 +1,5 @@
+> This package is the MaryML release fork `maryml-cubecl-hip`. Its Rust library and dependency alias remain `cubecl_hip`; the upstream implementation, attribution, and documentation below are retained.
+
 # ROCm HIP runtime
 
 Runtime that runs on ROCm HIP supported AMD GPUs.

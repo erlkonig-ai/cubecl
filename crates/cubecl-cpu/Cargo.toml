@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-name = "cubecl-cpu"
+name = "maryml-cubecl-cpu"
 version = "0.10.0"
 authors = ["marcantoinem <marc-antoine.m@outlook.com>"]
 build = "build.rs"
@@ -25,7 +25,7 @@ readme = "README.md"
 keywords = ["cpu"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-cpu"
+repository = "https://github.com/erlkonig-ai/cubecl"
 resolver = "2"
 
 [features]
@@ -61,16 +61,22 @@ features = ["std"]
 default-features = false
 
 [dependencies.cubecl-core]
+package = "maryml-cubecl-core"
+path = "../cubecl-core"
 version = "0.10.0"
 features = ["std"]
 default-features = false
 
 [dependencies.cubecl-opt]
+package = "maryml-cubecl-opt"
+path = "../cubecl-opt"
 version = "0.10.0"
 features = ["std"]
 default-features = false
 
 [dependencies.cubecl-runtime]
+package = "maryml-cubecl-runtime"
+path = "../cubecl-runtime"
 version = "0.10.0"
 features = [
     "channel-mutex",
@@ -80,6 +86,8 @@ features = [
 default-features = false
 
 [dependencies.cubecl-std]
+package = "maryml-cubecl-std"
+path = "../cubecl-std"
 version = "0.10.0"
 default-features = false
 
@@ -119,10 +127,14 @@ version = "20.1.4-6"
 features = ["mlir-helpers"]
 
 [dev-dependencies.cubecl-core]
+package = "maryml-cubecl-core"
+path = "../cubecl-core"
 version = "0.10.0"
 features = ["export_tests"]
 
 [dev-dependencies.cubecl-std]
+package = "maryml-cubecl-std"
+path = "../cubecl-std"
 version = "0.10.0"
 features = ["export_tests"]
 

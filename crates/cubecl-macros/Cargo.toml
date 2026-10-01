@@ -8,12 +8,13 @@ description = "Procedural macros for CubeCL"
 edition.workspace = true
 keywords = []
 license.workspace = true
-name = "cubecl-macros"
+name = "maryml-cubecl-macros"
 readme.workspace = true
-repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-macros"
+repository = "https://github.com/erlkonig-ai/cubecl"
 version.workspace = true
 
 [lib]
+name = "cubecl_macros"
 proc-macro = true
 
 

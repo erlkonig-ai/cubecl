@@ -1,3 +1,5 @@
+> This package is the MaryML release fork `maryml-cubecl-spirv`. Its Rust library and dependency alias remain `cubecl_spirv`; the upstream implementation, attribution, and documentation below are retained.
+
 # SPIR-V Compiler
 This crate is a compiler for cubecl_ir that passes through cubecl_opt to generate directly SPIR-V. It is then run with the `cubecl-wgpu` runtime.
 

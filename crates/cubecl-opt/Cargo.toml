@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-name = "cubecl-opt"
+name = "maryml-cubecl-opt"
 version = "0.10.0"
 authors = ["Genna Wingert"]
 build = false
@@ -28,7 +28,7 @@ keywords = [
 ]
 categories = ["algorithms"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-opt"
+repository = "https://github.com/erlkonig-ai/cubecl"
 resolver = "2"
 
 [features]
@@ -53,6 +53,8 @@ version = "0.10.0"
 default-features = false
 
 [dependencies.cubecl-core]
+package = "maryml-cubecl-core"
+path = "../cubecl-core"
 version = "0.10.0"
 default-features = false
 

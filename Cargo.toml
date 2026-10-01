@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cubecl",
+    "crates/cubecl-core",
+    "crates/cubecl-cpp",
+    "crates/cubecl-cpu",
+    "crates/cubecl-cuda",
+    "crates/cubecl-hip",
+    "crates/cubecl-macros",
+    "crates/cubecl-opt",
+    "crates/cubecl-runtime",
+    "crates/cubecl-spirv",
+    "crates/cubecl-std",
+    "crates/cubecl-wgpu",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+rust-version = "1.92"
+version = "0.10.0"
+
+[workspace.lints.rust]
+warnings = "warn"
+
+[workspace.lints.clippy]
+doc_markdown = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+invalid_html_tags = "warn"
+
+[workspace.dependencies]
+darling = "0.23.0"
+derive-new = { version = "0.7.0", default-features = false }
+ident_case = "1"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits", "visit-mut"] }

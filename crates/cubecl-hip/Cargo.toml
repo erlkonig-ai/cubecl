@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-name = "cubecl-hip"
+name = "maryml-cubecl-hip"
 version = "0.10.0"
 authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
 build = false
@@ -30,7 +30,7 @@ keywords = [
 ]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-hip"
+repository = "https://github.com/erlkonig-ai/cubecl"
 resolver = "2"
 
 [features]
@@ -69,10 +69,14 @@ features = [
 ]
 
 [dependencies.cubecl-core]
+package = "maryml-cubecl-core"
+path = "../cubecl-core"
 version = "0.10.0"
 default-features = false
 
 [dependencies.cubecl-cpp]
+package = "maryml-cubecl-cpp"
+path = "../cubecl-cpp"
 version = "0.10.0"
 features = ["hip"]
 default-features = false
@@ -81,6 +85,8 @@ default-features = false
 version = "7.1.5280200"
 
 [dependencies.cubecl-runtime]
+package = "maryml-cubecl-runtime"
+path = "../cubecl-runtime"
 version = "0.10.0"
 features = ["channel-mutex"]
 default-features = false
@@ -120,10 +126,14 @@ optional = true
 default-features = false
 
 [dev-dependencies.cubecl-core]
+package = "maryml-cubecl-core"
+path = "../cubecl-core"
 version = "0.10.0"
 features = ["export_tests"]
 
 [dev-dependencies.cubecl-std]
+package = "maryml-cubecl-std"
+path = "../cubecl-std"
 version = "0.10.0"
 features = ["export_tests"]
 

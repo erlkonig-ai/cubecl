@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-name = "cubecl-core"
+name = "maryml-cubecl-core"
 version = "0.10.0"
 authors = [
     "nathanielsimard <nathaniel.simard.42@gmail.com>",
@@ -32,7 +32,7 @@ categories = [
     "algorithms",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-core"
+repository = "https://github.com/erlkonig-ai/cubecl"
 resolver = "2"
 
 [features]
@@ -82,10 +82,14 @@ features = ["serde"]
 default-features = false
 
 [dependencies.cubecl-macros]
+package = "maryml-cubecl-macros"
+path = "../cubecl-macros"
 version = "0.10.0"
 default-features = false
 
 [dependencies.cubecl-runtime]
+package = "maryml-cubecl-runtime"
+path = "../cubecl-runtime"
 version = "0.10.0"
 default-features = false
 

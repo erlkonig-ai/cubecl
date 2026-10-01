@@ -1,3 +1,5 @@
+> This package is the MaryML release fork `maryml-cubecl-cuda`. Its Rust library and dependency alias remain `cubecl_cuda`; the upstream implementation, attribution, and documentation below are retained.
+
 # Cuda runtime
 
 The runtime uses the lower level primitives from [cudarc](https://github.com/coreylowman/cudarc) to compile generated CUDA code into a ptx and execute it at runtime.

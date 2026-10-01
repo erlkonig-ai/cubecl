@@ -1,0 +1,679 @@
+{
+  "census_sha256": "4b52b065f5152772e795f760eb1d24316aa4b22c90b88e01445702728ffcca5e",
+  "source_import_commit": "0d5ebb9813c480eca0fe805a20fef04274fd6463",
+  "source_policy": "Exact package source archives/Git objects only; excluded any target* directory and .cargo-ok cache markers. Rust, kernel, compiler and build-script implementation files unchanged.",
+  "packages": [
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-cpu",
+          "optional": true,
+          "published_name": "maryml-cubecl-cpu",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-cuda",
+          "optional": true,
+          "published_name": "maryml-cubecl-cuda",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-hip",
+          "optional": true,
+          "published_name": "maryml-cubecl-hip",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-ir",
+          "optional": false,
+          "published_name": "cubecl-ir",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-std",
+          "optional": true,
+          "published_name": "maryml-cubecl-std",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-wgpu",
+          "optional": true,
+          "published_name": "maryml-cubecl-wgpu",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl",
+      "proposed_name": "maryml-cubecl",
+      "source": {
+        "kind": "registry",
+        "manifest_sha256": "771808c6ce0e1b0cdfe479760cdc9c20d224d17b5159f3ad3aedea6fdf140cfe",
+        "sha256": "fd203fef6e359472e4cb8f6c0ef3eca062815a1edd560eb6d6c1d5c1397838d9",
+        "url": "https://static.crates.io/crates/cubecl/cubecl-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "5ec99c87bfb330d0e4f93c9be4e5ae7293083210"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-ir",
+          "optional": false,
+          "published_name": "cubecl-ir",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-macros",
+          "optional": false,
+          "published_name": "maryml-cubecl-macros",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-zspace",
+          "optional": false,
+          "published_name": "cubecl-zspace",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-core",
+      "proposed_name": "maryml-cubecl-core",
+      "source": {
+        "kind": "registry",
+        "manifest_sha256": "93198e0d50f516eb83f8c51ff22148df4030eb510db5da147d0b1e280df4a3b3",
+        "sha256": "a7522e7acf25d7848032c7b5270780f9f2abe84e13c7ed6345aa27ba70c312ca",
+        "url": "https://static.crates.io/crates/cubecl-core/cubecl-core-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "91d22cd82191f2be82e872be177f5dd09e6b3421"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-opt",
+          "optional": false,
+          "published_name": "maryml-cubecl-opt",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-cpp",
+      "proposed_name": "maryml-cubecl-cpp",
+      "source": {
+        "kind": "registry",
+        "manifest_sha256": "8b46b792af330bdb6db67685f082a1748d1a3db1c533bc4c0a4cc15059589a51",
+        "sha256": "411af04828cbf4583ecd388579fb30cd7a644eec19a334bb8f0d9d08522e1458",
+        "url": "https://static.crates.io/crates/cubecl-cpp/cubecl-cpp-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "38644e9f2db900ade6b0a1b004127182a85dae76"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-opt",
+          "optional": false,
+          "published_name": "maryml-cubecl-opt",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-std",
+          "optional": false,
+          "published_name": "maryml-cubecl-std",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-std",
+          "optional": false,
+          "published_name": "maryml-cubecl-std",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-cpu",
+      "proposed_name": "maryml-cubecl-cpu",
+      "source": {
+        "kind": "registry",
+        "manifest_sha256": "f6bb2e62451cb0b3f18500290a093764dd632144b9c56b8667255decacc0b001",
+        "sha256": "f572143f54e42a49ee0635a4ec36005f639e62be029e4f49890c808985981b35",
+        "url": "https://static.crates.io/crates/cubecl-cpu/cubecl-cpu-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "8fdd0f6e30d4eb3069782cb76e5a5df89baa9818"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-cpp",
+          "optional": false,
+          "published_name": "maryml-cubecl-cpp",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-std",
+          "optional": false,
+          "published_name": "maryml-cubecl-std",
+          "requirement": "0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-cuda",
+      "proposed_name": "maryml-cubecl-cuda",
+      "source": {
+        "commit": "1fc64da1fba7f9609d19a569000bdd6a6eaea2cd",
+        "kind": "git",
+        "manifest_sha256": "1f053e3035d1ee79b3e178c24d73f600f79df9a3e04d822d725babed4d4b7c49",
+        "path_in_repository": "cubecl-cuda",
+        "upstream_repository": "https://github.com/tracel-ai/cubecl",
+        "input_label": "release-warm-20261001/source/cubecl-graph"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "978c160b070c7e86286e1d7c2915455e096367dd"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-cpp",
+          "optional": false,
+          "published_name": "maryml-cubecl-cpp",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-hip-sys",
+          "optional": false,
+          "published_name": "cubecl-hip-sys",
+          "requirement": "^7.1.5280200",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-std",
+          "optional": false,
+          "published_name": "maryml-cubecl-std",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-hip",
+      "proposed_name": "maryml-cubecl-hip",
+      "source": {
+        "kind": "registry",
+        "manifest_sha256": "923950d1e8e711b3c77c9f77bfe8d2b945dded244a294af4f6d03922d9c038db",
+        "sha256": "3c6b510a9348f06ecd56b32cf10eb6241639e927a87f5c09ec61cc7a7610d5a3",
+        "url": "https://static.crates.io/crates/cubecl-hip/cubecl-hip-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "d6a46fe2fb2050ead7866ef52a7cf2e0042b3ba7"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-macros",
+      "proposed_name": "maryml-cubecl-macros",
+      "source": {
+        "commit": "8b2aa74e2514e39562df6e384a271c2ef9e53b06",
+        "kind": "git",
+        "manifest_sha256": "b6154a5c5bd3cd0f428edd92ecbb0a3f5d91d8dff11d2b1fc06d2f4cbb2a48af",
+        "path_in_repository": "crates/cubecl-macros",
+        "upstream_repository": "https://github.com/tracel-ai/cubecl",
+        "input_label": "cubecl Cargo Git source checkout 8b2aa74"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "be84ac81b857f201c385397484e34f97d29acb94"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-ir",
+          "optional": false,
+          "published_name": "cubecl-ir",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-opt",
+      "proposed_name": "maryml-cubecl-opt",
+      "source": {
+        "kind": "registry",
+        "manifest_sha256": "ed8bf70d28229793bc28a91314275144a74c6a9c99381bbda2912e8d359491a9",
+        "sha256": "0a599c6c3efefdcee8636994c90e58ef696c7efbed2d18b5b5ad8d5f29923abb",
+        "url": "https://static.crates.io/crates/cubecl-opt/cubecl-opt-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "10f8fb6961f909c82e9fad7fef0a9658c59f2bd6"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-ir",
+          "optional": false,
+          "published_name": "cubecl-ir",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-zspace",
+          "optional": false,
+          "published_name": "cubecl-zspace",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "0.10.0",
+          "target": "cfg(any(target_os = \"windows\", target_os = \"linux\", target_os = \"macos\", target_os = \"android\"))"
+        }
+      ],
+      "old_name": "cubecl-runtime",
+      "proposed_name": "maryml-cubecl-runtime",
+      "source": {
+        "commit": "1fc64da1fba7f9609d19a569000bdd6a6eaea2cd",
+        "kind": "git",
+        "manifest_sha256": "2e32e5fadf146c8e66dfa50685acfb06478ae2ed86deddd6745884a5301c3bc9",
+        "path_in_repository": "cubecl-runtime",
+        "upstream_repository": "https://github.com/tracel-ai/cubecl",
+        "input_label": "release-warm-20261001/source/cubecl-graph"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "1c7f85a389aa0c5c19fde34f2f9b2047dbe5290d"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-opt",
+          "optional": false,
+          "published_name": "maryml-cubecl-opt",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-spirv",
+      "proposed_name": "maryml-cubecl-spirv",
+      "source": {
+        "kind": "registry",
+        "sha256": "cd12ded588654255e94e3d80a58e0988fdf50dd6b80365795072b04b99884f88",
+        "url": "https://static.crates.io/crates/cubecl-spirv/cubecl-spirv-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "809ae54e65107335e36fa6ba5b45725d63fd339c"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "^0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "^0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-std",
+      "proposed_name": "maryml-cubecl-std",
+      "source": {
+        "kind": "registry",
+        "manifest_sha256": "67e5d26d50b4842cd994e0f8d0bb1fb9d65b1dbc2a0166d9be39681281b9f1e7",
+        "sha256": "b391b584a4897683dd9fc0767f96337ac712b733126ce0f68a9ee8a2df073d2d",
+        "url": "https://static.crates.io/crates/cubecl-std/cubecl-std-0.10.0.crate"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "af84afee78eb69e4633bf616a67e451e4f9a9787"
+    },
+    {
+      "family_dependencies": [
+        {
+          "kind": "dependencies",
+          "name": "cubecl-common",
+          "optional": false,
+          "published_name": "cubecl-common",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-cpp",
+          "optional": true,
+          "published_name": "maryml-cubecl-cpp",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-ir",
+          "optional": false,
+          "published_name": "cubecl-ir",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-runtime",
+          "optional": false,
+          "published_name": "maryml-cubecl-runtime",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dependencies",
+          "name": "cubecl-spirv",
+          "optional": true,
+          "published_name": "maryml-cubecl-spirv",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-core",
+          "optional": false,
+          "published_name": "maryml-cubecl-core",
+          "requirement": "0.10.0",
+          "target": null
+        },
+        {
+          "kind": "dev-dependencies",
+          "name": "cubecl-std",
+          "optional": false,
+          "published_name": "maryml-cubecl-std",
+          "requirement": "0.10.0",
+          "target": null
+        }
+      ],
+      "old_name": "cubecl-wgpu",
+      "proposed_name": "maryml-cubecl-wgpu",
+      "source": {
+        "commit": "1fc64da1fba7f9609d19a569000bdd6a6eaea2cd",
+        "kind": "git",
+        "manifest_sha256": "791d20431cfb29fa8ed7192cdd2974cad050bce7b262f3df0f16a2ad8edbd4ef",
+        "path_in_repository": "cubecl-wgpu",
+        "upstream_repository": "https://github.com/tracel-ai/cubecl",
+        "input_label": "release-warm-20261001/source/cubecl-graph"
+      },
+      "version": "0.10.0",
+      "imported_package_tree": "3c83cfa46dcbd6eab22d40f1feff35a09f01a975"
+    }
+  ],
+  "license_sha256": {
+    "LICENSE-MIT": "b3b77503e5498c5fb0a1a0b102d748d7baed9cae9f502086a3cfedad62d503a4",
+    "LICENSE-APACHE": "bdd26d197850a30393da963f01e97c78e91d69245089c543903f96a5dab95930"
+  },
+  "license_source": {
+    "registry_package": "cubecl",
+    "version": "0.10.0",
+    "archive_sha256": "fd203fef6e359472e4cb8f6c0ef3eca062815a1edd560eb6d6c1d5c1397838d9",
+    "upstream_vcs_commit": "7cf203735e095e640a2c03b2400d0faa03196bb4",
+    "reason": "Copied unchanged root license texts into four same-revision registry packages whose archives omitted them.",
+    "packages": [
+      "cubecl-cpp",
+      "cubecl-opt",
+      "cubecl-spirv",
+      "cubecl-std"
+    ]
+  }
+}

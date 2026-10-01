@@ -1,3 +1,5 @@
+> This package is the MaryML release fork `maryml-cubecl-wgpu`. Its Rust library and dependency alias remain `cubecl_wgpu`; the upstream implementation, attribution, and documentation below are retained.
+
 # CubeCL WGPU Runtime
 
 [CubeCL](https://github.com/tracel-ai/cubecl) WGPU runtime.

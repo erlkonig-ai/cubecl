@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-name = "cubecl-runtime"
+name = "maryml-cubecl-runtime"
 version = "0.10.0"
 authors = [
     "louisfd <louisfd94@gmail.com>",
@@ -32,7 +32,7 @@ keywords = [
 ]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-runtime"
+repository = "https://github.com/erlkonig-ai/cubecl"
 resolver = "2"
 
 [features]

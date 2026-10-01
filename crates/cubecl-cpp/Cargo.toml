@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-name = "cubecl-cpp"
+name = "maryml-cubecl-cpp"
 version = "0.10.0"
 authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
 build = false
@@ -31,7 +31,7 @@ keywords = [
 ]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-cpp"
+repository = "https://github.com/erlkonig-ai/cubecl"
 resolver = "2"
 
 [features]
@@ -68,14 +68,20 @@ version = "0.10.0"
 default-features = false
 
 [dependencies.cubecl-core]
+package = "maryml-cubecl-core"
+path = "../cubecl-core"
 version = "0.10.0"
 default-features = false
 
 [dependencies.cubecl-opt]
+package = "maryml-cubecl-opt"
+path = "../cubecl-opt"
 version = "0.10.0"
 default-features = false
 
 [dependencies.cubecl-runtime]
+package = "maryml-cubecl-runtime"
+path = "../cubecl-runtime"
 version = "0.10.0"
 features = ["channel-mutex"]
 default-features = false

@@ -1,3 +1,5 @@
+> This package is the MaryML release fork `maryml-cubecl-core`. Its Rust library and dependency alias remain `cubecl_core`; the upstream implementation, attribution, and documentation below are retained.
+
 <div align="center">
 <img src="./assets/logo.drawio.svg" width="400px"/>
 
