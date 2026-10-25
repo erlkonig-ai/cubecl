@@ -16,7 +16,8 @@ fn render(input: Variable<Cuda>, width: usize, kind: FP8Kind) -> String {
             special_cast(f, &self.0, &self.1)
         }
     }
-    let out = named(Elem::FP8(kind), width, "output");
+    // Kernel IR locals participate in optimization; Named variables do not.
+    let out = Variable::LocalMut { id: 2, item: Item::new(Elem::FP8(kind), width, false) };
     format!("{}", Cast(input, out))
 }
 
@@ -73,14 +74,15 @@ fn already_vector_half_sources_keep_pair_order() {
     ] {
         for kind in [FP8Kind::E4M3, FP8Kind::E5M2] {
             for width in [2, 4, 16] {
-                let code = render(named(elem, width, "source"), width, kind);
+                let input = Variable::LocalMut { id: 1, item: Item::new(elem, width, false) };
+                let code = render(input, width, kind);
                 let lines = conversion_lines(&code);
                 assert_eq!(lines.len(), width / 2, "{code}");
                 for (i, line) in lines.iter().enumerate() {
                     let value = if width == 2 {
-                        format!("reinterpret_cast<{pair} &>(source)")
+                        format!("reinterpret_cast<{pair} &>(l_mut_1)")
                     } else {
-                        format!("(reinterpret_cast<{pair}_{} &>(source)).i_{i}", width / 2)
+                        format!("(reinterpret_cast<{pair}_{} &>(l_mut_1)).i_{i}", width / 2)
                     };
                     let expected = format!("__nv_cvt_{intrinsic}_to_fp8x2({value}, __NV_NOSAT, __NV_{kind:?})");
                     assert!(line.contains(&expected), "{code}");
@@ -96,14 +98,15 @@ fn f32_sources_keep_broadcast_and_adjacent_lane_order() {
     for kind in [FP8Kind::E4M3, FP8Kind::E5M2] {
         for width in [2, 4, 16] {
             for input_width in [1, width] {
-                let code = render(named(Elem::F32, input_width, "source"), width, kind);
+                let input = Variable::LocalMut { id: 1, item: Item::new(Elem::F32, input_width, false) };
+                let code = render(input, width, kind);
                 let lines = conversion_lines(&code);
                 assert_eq!(lines.len(), width / 2, "{code}");
                 for (i, line) in lines.iter().enumerate() {
                     let value = if input_width == 1 {
-                        "float2 { source, source }".to_owned()
+                        "float2 { l_mut_1, l_mut_1 }".to_owned()
                     } else {
-                        format!("float2 {{ source.i_{}, source.i_{} }}", 2 * i, 2 * i + 1)
+                        format!("float2 {{ l_mut_1.i_{}, l_mut_1.i_{} }}", 2 * i, 2 * i + 1)
                     };
                     let expected = format!("__nv_cvt_float2_to_fp8x2({value}, __NV_NOSAT, __NV_{kind:?})");
                     assert!(line.contains(&expected), "{code}");
