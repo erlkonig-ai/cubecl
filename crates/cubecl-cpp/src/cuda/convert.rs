@@ -267,10 +267,27 @@ fn float_to_packed<D: Dialect>(input: Variable<D>, i: usize, packing: usize) -> 
                 format!("{}", input.index(i))
             }
         }
+        Elem::F16 | Elem::BF16 if packing > 1 => {
+            // A scalar broadcast can reach a packed output without becoming a
+            // packed input (e.g. integer zero -> BF16 -> FP8 vector). Construct
+            // the pair explicitly; the CUDA constructors copy both lanes, so
+            // signed zero and NaN bits undergo no intermediate arithmetic.
+            let pair = match input.elem() {
+                Elem::F16 => Elem::<D>::F16x2,
+                Elem::BF16 => Elem::<D>::BF16x2,
+                _ => unreachable!(),
+            };
+            let i = i * packing;
+            format!("{pair} {{ {}, {} }}", input.index(i), input.index(i + 1))
+        }
         Elem::F16 | Elem::F16x2 | Elem::BF16 | Elem::BF16x2 => format!("{}", input.index(i)),
         _ => unreachable!(),
     }
 }
+
+#[cfg(test)]
+#[path = "convert_tests.rs"]
+mod tests;
 
 /// Convert any FP8/6/4 except e8m0 to half
 fn cast_minifloat_to_half<D: Dialect>(
