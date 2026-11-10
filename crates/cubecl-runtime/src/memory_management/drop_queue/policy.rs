@@ -85,14 +85,22 @@ impl Default for FlushingPolicy {
 #[derive(Default, Debug)]
 pub(crate) struct FlushingPolicyState {
     bytes_count: u32,
-    bytes_size: u32,
+    /// Staged bytes since the last flush. 64-bit: uploads between two flushes
+    /// can exceed 4 GiB, and a 32-bit sum would wrap (or a single buffer
+    /// truncate) below the threshold, so the size limit would stop firing.
+    bytes_size: u64,
 }
 
 impl FlushingPolicyState {
     /// Record a newly staged [`Bytes`] allocation.
     pub(crate) fn register(&mut self, bytes: &Bytes) {
-        self.bytes_count += 1;
-        self.bytes_size += bytes.len() as u32;
+        self.register_len(bytes.len());
+    }
+
+    /// Record a staged allocation of `len` bytes.
+    pub(crate) fn register_len(&mut self, len: usize) {
+        self.bytes_count = self.bytes_count.saturating_add(1);
+        self.bytes_size = self.bytes_size.saturating_add(len as u64);
     }
 
     /// Reset all counters, typically called after a flush.
@@ -103,7 +111,8 @@ impl FlushingPolicyState {
 
     /// Returns `true` if either threshold in `policy` has been reached.
     pub(crate) fn should_flush(&self, policy: &FlushingPolicy) -> bool {
-        self.bytes_count >= policy.max_bytes_count || self.bytes_size >= policy.max_bytes_size
+        self.bytes_count >= policy.max_bytes_count
+            || self.bytes_size >= u64::from(policy.max_bytes_size)
     }
 }
 
@@ -156,6 +165,41 @@ mod policy_tests {
         s.register(&Bytes::from_elems(vec![0u8; 60]));
         s.register(&Bytes::from_elems(vec![0u8; 60]));
         assert!(s.should_flush(&policy()));
+    }
+
+    // Staged uploads can exceed 4 GiB between flushes (a device copy of model
+    // weights stages each tensor once). The size counter must not truncate or
+    // wrap there, or the size threshold silently stops firing.
+    const GIB: usize = 1 << 30;
+
+    fn large_policy() -> FlushingPolicy {
+        FlushingPolicy {
+            max_bytes_count: u32::MAX,
+            max_bytes_size: 64 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn a_single_upload_of_4_gib_reaches_the_size_threshold() {
+        let mut s = state();
+        s.register_len(4 * GIB);
+        assert!(s.should_flush(&large_policy()));
+    }
+
+    #[test]
+    fn staged_total_past_4_gib_does_not_wrap() {
+        let mut s = state();
+        s.register_len(2 * GIB);
+        s.register_len(2 * GIB);
+        assert!(s.should_flush(&large_policy()));
+    }
+
+    #[test]
+    fn counters_saturate_instead_of_overflowing() {
+        let mut s = state();
+        s.register_len(usize::MAX);
+        s.register_len(usize::MAX);
+        assert!(s.should_flush(&large_policy()));
     }
 
     #[test]
