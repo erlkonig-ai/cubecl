@@ -4,12 +4,18 @@ use cubecl_common::bytes::Bytes;
 use crate::memory_management::{
     drop_queue::FlushingPolicy, drop_queue::policy::FlushingPolicyState,
 };
+use crate::server::ServerError;
 
 /// A synchronization primitive that blocks until the device has finished
 /// processing all commands submitted before the fence was created.
 pub trait Fence {
-    /// Block the current thread until the signals this fence.
-    fn sync(self);
+    /// Block the current thread until the device signals this fence.
+    ///
+    /// An error means the wait did not prove that the device finished the
+    /// work before the fence. The queue then keeps alive every buffer the
+    /// fence protects and returns the error from
+    /// [`PendingDropQueue::flush`].
+    fn sync(self) -> Result<(), ServerError>;
 }
 
 /// Defers the drop of CPU-side [`Bytes`] allocations until the device has
@@ -115,20 +121,26 @@ impl<F: Fence> PendingDropQueue<F> {
     /// `factory` is called to produce a [`Fence`]. It should submit (or
     /// record) a device signal command so that syncing the fence guarantees all
     /// preceding device work is complete.
-    pub fn flush<Factory: Fn() -> F>(&mut self, factory: Factory) {
+    ///
+    /// # Errors
+    ///
+    /// When a fence wait fails, the error is returned and nothing is freed or
+    /// rotated: `pending` and `staged` keep their bytes, because the device
+    /// may still be reading them. The next flush retries with a fresh fence
+    /// through the safety net below.
+    pub fn flush<Factory: Fn() -> F>(&mut self, factory: Factory) -> Result<(), ServerError> {
         // Sync the fence from the previous flush and free the bytes it was
         // protecting.
         if let Some(event) = self.fence.take() {
-            event.sync();
+            event.sync()?;
             self.pending.clear();
         }
 
-        // Safety net: if pending is somehow still populated (no prior fence),
-        // stall immediately rather than freeing memory the GPU might still
-        // be reading.
+        // Safety net: if pending is still populated with no fence (none was
+        // recorded, or the last wait on it failed), stall now rather than
+        // freeing memory the GPU might still be reading.
         if !self.pending.is_empty() {
-            let event = factory();
-            event.sync();
+            factory().sync()?;
             self.pending.clear();
         }
 
@@ -139,6 +151,7 @@ impl<F: Fence> PendingDropQueue<F> {
         // free.
         self.fence = Some(factory());
         self.policy_state.reset();
+        Ok(())
     }
 }
 
@@ -158,8 +171,9 @@ mod tests {
     }
 
     impl Fence for MockFence<'_> {
-        fn sync(self) {
+        fn sync(self) -> Result<(), ServerError> {
             self.sync_count.set(self.sync_count.get() + 1);
+            Ok(())
         }
     }
 
@@ -222,7 +236,7 @@ mod tests {
         let (mut queue, factory) = make_queue(&sync_count);
 
         queue.push(sample_bytes());
-        queue.flush(&factory);
+        queue.flush(&factory).unwrap();
 
         // The fence is created but must not be synced yet — that happens on
         // the next flush.
@@ -239,10 +253,10 @@ mod tests {
         let (mut queue, factory) = make_queue(&sync_count);
 
         queue.push(sample_bytes());
-        queue.flush(&factory); // flush 1 – creates fence A
+        queue.flush(&factory).unwrap(); // flush 1 – creates fence A
 
         queue.push(sample_bytes());
-        queue.flush(&factory); // flush 2 – syncs fence A, creates fence B
+        queue.flush(&factory).unwrap(); // flush 2 – syncs fence A, creates fence B
 
         assert_eq!(sync_count.get(), 1, "exactly one sync after two flushes");
     }
@@ -254,7 +268,7 @@ mod tests {
 
         for _ in 0..10 {
             queue.push(sample_bytes());
-            queue.flush(&factory);
+            queue.flush(&factory).unwrap();
         }
 
         // Each flush except the first syncs the fence from the previous one.
@@ -273,7 +287,7 @@ mod tests {
         for _ in 0..5 {
             queue.push(sample_bytes());
         }
-        queue.flush(&factory);
+        queue.flush(&factory).unwrap();
 
         assert!(queue.staged.is_empty());
     }
@@ -286,7 +300,7 @@ mod tests {
         for _ in 0..5 {
             queue.push(sample_bytes());
         }
-        queue.flush(&factory);
+        queue.flush(&factory).unwrap();
 
         assert_eq!(queue.pending.len(), 5);
     }
@@ -299,10 +313,10 @@ mod tests {
         for _ in 0..5 {
             queue.push(sample_bytes());
         }
-        queue.flush(&factory); // pending = 5 items
+        queue.flush(&factory).unwrap(); // pending = 5 items
 
         queue.push(sample_bytes());
-        queue.flush(&factory); // syncs fence → pending cleared, rotated
+        queue.flush(&factory).unwrap(); // syncs fence → pending cleared, rotated
 
         // Only the one item staged between the two flushes should be pending.
         assert_eq!(queue.pending.len(), 1);
@@ -322,7 +336,7 @@ mod tests {
         }
         assert!(queue.should_flush());
 
-        queue.flush(&factory);
+        queue.flush(&factory).unwrap();
 
         assert!(
             !queue.should_flush(),
@@ -340,8 +354,68 @@ mod tests {
         let (mut queue, factory) = make_queue(&sync_count);
 
         // Should not panic regardless of how many times it is called.
-        queue.flush(&factory);
-        queue.flush(&factory);
-        queue.flush(&factory);
+        queue.flush(&factory).unwrap();
+        queue.flush(&factory).unwrap();
+        queue.flush(&factory).unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // flush – a fence wait that fails
+    // ---------------------------------------------------------------------------
+
+    /// A fence whose wait fails while `fail` is set.
+    struct FailingFence<'a> {
+        fail: &'a Cell<bool>,
+    }
+
+    impl Fence for FailingFence<'_> {
+        fn sync(self) -> Result<(), ServerError> {
+            match self.fail.get() {
+                true => Err(ServerError::Generic {
+                    reason: "fence wait failed".into(),
+                    backtrace: cubecl_common::backtrace::BackTrace::capture(),
+                }),
+                false => Ok(()),
+            }
+        }
+    }
+
+    fn tagged(tag: u8) -> Bytes {
+        Bytes::from_elems(vec![tag; 4])
+    }
+
+    fn tags(list: &[Bytes]) -> Vec<u8> {
+        list.iter().map(|bytes| bytes[0]).collect()
+    }
+
+    #[test]
+    fn a_failed_fence_wait_keeps_the_bytes_it_protects_and_is_returned() {
+        let fail = Cell::new(false);
+        let factory = || FailingFence { fail: &fail };
+        let mut queue = PendingDropQueue::new(test_policy());
+
+        queue.push(tagged(1));
+        queue.flush(factory).unwrap(); // 1 is pending behind fence A
+
+        queue.push(tagged(2));
+        fail.set(true);
+        assert!(
+            queue.flush(factory).is_err(),
+            "a failed wait must reach the caller"
+        );
+        // Nothing the device may still read was freed, and nothing rotated.
+        assert_eq!(tags(&queue.pending), vec![1]);
+        assert_eq!(tags(&queue.staged), vec![2]);
+
+        // While waits keep failing, the safety net fails too and frees nothing.
+        assert!(queue.flush(factory).is_err());
+        assert_eq!(tags(&queue.pending), vec![1]);
+        assert_eq!(tags(&queue.staged), vec![2]);
+
+        // Once a fresh fence completes, 1 is freed and 2 becomes pending.
+        fail.set(false);
+        queue.flush(factory).unwrap();
+        assert_eq!(tags(&queue.pending), vec![2]);
+        assert!(queue.staged.is_empty());
     }
 }

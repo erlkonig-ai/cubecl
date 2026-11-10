@@ -397,7 +397,10 @@ impl<'a> Command<'a> {
             .execute_task(stream, kernel_id, dispatch_count, resources);
 
         if stream.drop_queue.should_flush() {
-            stream.drop_queue.flush(|| Fence::new(stream.sys));
+            // A failed wait frees nothing; the stream's error list reports it.
+            if let Err(err) = stream.drop_queue.flush(|| Fence::new(stream.sys)) {
+                stream.errors.push(err);
+            }
         }
 
         if let Err(err) = result {

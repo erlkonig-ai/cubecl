@@ -151,7 +151,9 @@ impl ComputeServer for HipServer {
         )?;
 
         let current = command.streams.current();
-        current.drop_queue.flush(|| Fence::new(current.sys));
+        // On a failed fence wait nothing is freed, host staging or device
+        // deallocations, and the caller gets the error.
+        current.drop_queue.flush(|| Fence::new(current.sys))?;
         current.memory_management_gpu.storage().flush();
 
         Ok(())

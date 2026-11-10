@@ -639,7 +639,11 @@ impl<'a> Command<'a> {
         // deferral spans one region, not the whole run.
         if !stream.capturing && stream.drop_queue.should_flush() {
             let span = host_stall_trace::start(host_stall_trace::Operation::DropFlush, 0);
-            stream.drop_queue.flush(|| Fence::new(stream.sys));
+            // A failed wait frees nothing; the stream's error list reports it
+            // to the next flush or sync, which then refuses.
+            if let Err(err) = stream.drop_queue.flush(|| Fence::new(stream.sys)) {
+                stream.errors.push(err);
+            }
             host_stall_trace::finish(span, || {
                 "may_include_prior_gpu_or_peer_work=true".to_string()
             });

@@ -30,8 +30,10 @@ pub struct Stream {
 }
 
 impl drop_queue::Fence for Fence {
-    fn sync(self) {
-        let _ = self.wait_sync().ok();
+    // The error is the drop queue's to act on: a wait that failed proves
+    // nothing, so the queue keeps the staged host bytes and reports it.
+    fn sync(self) -> Result<(), ServerError> {
+        self.wait_sync()
     }
 }
 
