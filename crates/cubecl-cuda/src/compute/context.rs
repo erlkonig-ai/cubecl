@@ -14,7 +14,7 @@ use crate::{
 };
 use cubecl_core::{
     compilation_cache::CompilationCache,
-    hash::StableHash,
+    hash::{StableHash, StableHasher},
     server::ResourceLimitError,
     {ir::DeviceProperties, prelude::*},
 };
@@ -57,6 +57,31 @@ pub struct PtxCacheEntry {
     ptx: Vec<std::ffi::c_char>,
 }
 
+/// What a kernel's PTX is a function of: its source, the compile options
+/// (the target architecture and include paths are among them), the toolkit
+/// whose headers it includes, and the NVRTC and driver doing the compiling. A
+/// change in any of them is another key.
+fn ptx_key(source: &str, options: &[&str]) -> Result<StableHash, CompilationError> {
+    let (mut major, mut minor, mut driver) = (0, 0, 0);
+    let generic = |reason: String| CompilationError::Generic {
+        reason,
+        backtrace: BackTrace::capture(),
+    };
+    // SAFETY: Both calls only write the integers they are handed.
+    unsafe {
+        cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor)
+            .result()
+            .map_err(|err| generic(format!("{err:?}")))?;
+        cudarc::driver::sys::cuDriverGetVersion(&mut driver)
+            .result()
+            .map_err(|err| generic(format!("{err:?}")))?;
+    }
+    let toolkit = std::fs::read(include_path().with_file_name("version.json")).unwrap_or_default();
+    Ok(StableHasher::hash_one(&(
+        source, options, toolkit, major, minor, driver,
+    )))
+}
+
 impl CudaContext {
     pub fn new(
         compilation_options: CompilationOptions,
@@ -73,7 +98,7 @@ impl CudaContext {
                 if let Some(cache) = &config.compilation.cache {
                     let root = cache.root();
                     Some(CompilationCache::new(
-                        "ptx",
+                        "ptx_by_source",
                         CacheOption::default().name("cuda").root(root),
                     ))
                 } else {
@@ -101,26 +126,6 @@ impl CudaContext {
         mode: ExecutionMode,
         logger: Arc<ServerLogger>,
     ) -> Result<(), LaunchError> {
-        let hash = if let Some(cache) = &self.ptx_cache {
-            let hash = kernel_id.stable_hash();
-
-            if let Some(entry) = cache.get(&hash) {
-                log::trace!("Using PTX cache");
-
-                self.load_ptx(
-                    entry.ptx.clone(),
-                    kernel_id.clone(),
-                    entry.entrypoint_name.clone(),
-                    kernel_id.cube_dim,
-                    entry.shared_mem_bytes,
-                )?;
-                return Ok(());
-            }
-            Some(hash)
-        } else {
-            None
-        };
-
         log::trace!("Compiling kernel");
 
         validate_cube_dim(&self.properties, kernel_id)?;
@@ -160,6 +165,30 @@ impl CudaContext {
         }
 
         logger.log_compilation(&kernel_compiled);
+
+        let repr = kernel_compiled.repr.unwrap();
+        let shared_mem_bytes = repr.shared_memory_size();
+        let hash = match &self.ptx_cache {
+            Some(_) => Some(ptx_key(&kernel_compiled.source, &options)?),
+            None => None,
+        };
+        let cached = hash.and_then(|hash| self.ptx_cache.as_ref()?.get(&hash).cloned());
+        if let Some(entry) = cached
+            && entry.entrypoint_name == kernel_compiled.entrypoint_name
+            && entry.shared_mem_bytes == shared_mem_bytes
+        {
+            log::trace!("Using PTX cache");
+            match self.load_ptx(
+                entry.ptx,
+                kernel_id.clone(),
+                entry.entrypoint_name,
+                cube_dim,
+                shared_mem_bytes,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(err) => log::warn!("Recompiling, the cached PTX does not load: {err:?}"),
+            }
+        }
 
         // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX from a program.
         // The `CString` source is null-terminated and outlives the program. On compilation
@@ -210,14 +239,12 @@ impl CudaContext {
             })?
         };
 
-        let repr = kernel_compiled.repr.unwrap();
-
         if let Some(cache) = &mut self.ptx_cache {
             let result = cache.insert(
                 hash.unwrap(),
                 PtxCacheEntry {
                     entrypoint_name: kernel_compiled.entrypoint_name.clone(),
-                    shared_mem_bytes: repr.shared_memory_size(),
+                    shared_mem_bytes,
                     ptx: ptx.clone(),
                 },
             );
@@ -231,7 +258,7 @@ impl CudaContext {
             kernel_id.clone(),
             kernel_compiled.entrypoint_name,
             cube_dim,
-            repr.shared_memory_size(),
+            shared_mem_bytes,
         )?;
         Ok(())
     }
@@ -360,5 +387,25 @@ impl CudaContext {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ptx_key;
+
+    #[test]
+    fn a_ptx_key_is_its_source_and_options() {
+        let key = |source, options: &[&str]| ptx_key(source, options).unwrap();
+        let base = key("a", &["-x", "-y"]);
+        assert_eq!(base, key("a", &["-x", "-y"]));
+        let others = [
+            key("b", &["-x", "-y"]),
+            key("a", &["-x", "-z"]),
+            key("a", &["-x"]),
+            key("a", &["-x-y"]),
+            key("a-x", &["-y"]),
+        ];
+        assert!(others.iter().all(|other| *other != base));
     }
 }
