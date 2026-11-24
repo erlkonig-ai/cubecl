@@ -61,7 +61,19 @@ pub struct PtxCacheEntry {
 /// (the target architecture and include paths are among them), the toolkit
 /// whose headers it includes, and the NVRTC and driver doing the compiling. A
 /// change in any of them is another key.
-fn ptx_key(source: &str, options: &[&str]) -> Result<StableHash, CompilationError> {
+///
+/// The toolkit is identified by its manifest, so reuse assumes that an installed
+/// toolkit does not change under an unchanged manifest: whoever edits its headers
+/// in place deletes the cache. Without a manifest there is no identity, and no key.
+fn ptx_key(
+    source: &str,
+    options: &[&str],
+    manifest: &std::path::Path,
+) -> Result<Option<StableHash>, CompilationError> {
+    let Ok(toolkit) = std::fs::read(manifest) else {
+        log::warn!("The PTX cache is bypassed, no readable toolkit manifest at {manifest:?}");
+        return Ok(None);
+    };
     let (mut major, mut minor, mut driver) = (0, 0, 0);
     let generic = |reason: String| CompilationError::Generic {
         reason,
@@ -76,10 +88,9 @@ fn ptx_key(source: &str, options: &[&str]) -> Result<StableHash, CompilationErro
             .result()
             .map_err(|err| generic(format!("{err:?}")))?;
     }
-    let toolkit = std::fs::read(include_path().with_file_name("version.json")).unwrap_or_default();
-    Ok(StableHasher::hash_one(&(
+    Ok(Some(StableHasher::hash_one(&(
         source, options, toolkit, major, minor, driver,
-    )))
+    ))))
 }
 
 impl CudaContext {
@@ -169,7 +180,11 @@ impl CudaContext {
         let repr = kernel_compiled.repr.unwrap();
         let shared_mem_bytes = repr.shared_memory_size();
         let hash = match &self.ptx_cache {
-            Some(_) => Some(ptx_key(&kernel_compiled.source, &options)?),
+            Some(_) => ptx_key(
+                &kernel_compiled.source,
+                &options,
+                &include_path.with_file_name("version.json"),
+            )?,
             None => None,
         };
         let cached = hash.and_then(|hash| self.ptx_cache.as_ref()?.get(&hash).cloned());
@@ -239,9 +254,9 @@ impl CudaContext {
             })?
         };
 
-        if let Some(cache) = &mut self.ptx_cache {
+        if let Some((cache, hash)) = self.ptx_cache.as_mut().zip(hash) {
             let result = cache.insert(
-                hash.unwrap(),
+                hash,
                 PtxCacheEntry {
                     entrypoint_name: kernel_compiled.entrypoint_name.clone(),
                     shared_mem_bytes,
@@ -395,9 +410,17 @@ mod tests {
     use super::ptx_key;
 
     #[test]
-    fn a_ptx_key_is_its_source_and_options() {
-        let key = |source, options: &[&str]| ptx_key(source, options).unwrap();
+    fn a_ptx_key_is_its_source_options_and_toolkit() {
+        let dir = std::env::temp_dir().join(format!("ptx-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("version.json");
+        let key = |source, options: &[&str]| ptx_key(source, options, &manifest).unwrap();
+
+        assert!(key("a", &["-x", "-y"]).is_none(), "no manifest, no key");
+
+        std::fs::write(&manifest, "13.0").unwrap();
         let base = key("a", &["-x", "-y"]);
+        assert!(base.is_some());
         assert_eq!(base, key("a", &["-x", "-y"]));
         let others = [
             key("b", &["-x", "-y"]),
@@ -407,5 +430,9 @@ mod tests {
             key("a-x", &["-y"]),
         ];
         assert!(others.iter().all(|other| *other != base));
+
+        std::fs::write(&manifest, "13.1").unwrap();
+        assert_ne!(base, key("a", &["-x", "-y"]), "another toolkit, another key");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
