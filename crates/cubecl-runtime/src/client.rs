@@ -213,7 +213,7 @@ impl<R: Runtime> ComputeClient<R> {
     fn do_create_from_slices(
         &self,
         descriptors: Vec<MemoryLayoutDescriptor>,
-        slices: Vec<Vec<u8>>,
+        data: Vec<Bytes>,
     ) -> Result<Vec<MemoryLayout>, IoError> {
         let stream_id = self.stream_id();
         let (handle_base, layouts) = self.utilities.layout_policy.apply(stream_id, &descriptors);
@@ -221,7 +221,7 @@ impl<R: Runtime> ComputeClient<R> {
         let descriptors = descriptors
             .into_iter()
             .zip(layouts.iter())
-            .zip(slices)
+            .zip(data)
             .map(|((desc, alloc), data)| {
                 (
                     CopyDescriptor::new(
@@ -230,11 +230,7 @@ impl<R: Runtime> ComputeClient<R> {
                         alloc.strides.clone(),
                         desc.elem_size,
                     ),
-                    // `data` is already an owned `Vec<u8>` the caller gave up;
-                    // `to_vec` here copied every byte a second time, which on a
-                    // 14 MB expert weight measured 0.48 ms of pure waste per
-                    // call, 1 666 calls to a forward.
-                    Bytes::from_bytes_vec(data),
+                    data,
                 )
             })
             .collect::<Vec<_>>();
@@ -298,7 +294,7 @@ impl<R: Runtime> ComputeClient<R> {
                 shape,
                 1,
             )],
-            vec![slice.to_vec()],
+            vec![copied(slice)],
         )
         .unwrap()
         .remove(0)
@@ -392,7 +388,7 @@ impl<R: Runtime> ComputeClient<R> {
                 shape,
                 elem_size,
             )],
-            vec![slice.to_vec()],
+            vec![copied(slice)],
         )
         .unwrap()
         .remove(0)
@@ -438,7 +434,7 @@ impl<R: Runtime> ComputeClient<R> {
         let mut data = Vec::with_capacity(descriptors.len());
         let mut descriptors_ = Vec::with_capacity(descriptors.len());
         for (a, b) in descriptors {
-            data.push(b.to_vec());
+            data.push(copied(b));
             descriptors_.push(a);
         }
 
@@ -1268,5 +1264,34 @@ impl<R: Runtime> ComputeClient<R> {
         let num_candidates = max.trailing_zeros() + 1;
 
         (0..num_candidates).map(|i| 2usize.pow(i)).rev()
+    }
+}
+
+/// `slice` in its own buffer, aligned as [`Bytes`] needs it, by one copy.
+///
+/// [`Bytes::from_bytes_vec`] over `slice.to_vec()` copies twice: a `Vec<u8>` is
+/// aligned to one byte, and `from_bytes_vec` moves it to an aligned buffer.
+fn copied(slice: &[u8]) -> Bytes {
+    let mut bytes = Bytes::from_elems(Vec::<u8>::new());
+    bytes.extend_from_byte_slice(slice);
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copied_slice_is_the_slice_in_an_aligned_buffer_of_its_size() {
+        for len in [0usize, 1, 15, 16, 17, 4096, 1 << 20] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let bytes = copied(&data);
+            assert_eq!(&*bytes, data.as_slice());
+            assert_eq!(bytes.capacity(), len.next_multiple_of(16));
+            if len > 0 {
+                assert_eq!(bytes.align(), Bytes::from_bytes_vec(data).align());
+                assert_eq!(bytes.as_ptr() as usize % bytes.align(), 0);
+            }
+        }
     }
 }
