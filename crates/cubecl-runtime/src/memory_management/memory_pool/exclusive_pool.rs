@@ -83,11 +83,23 @@ impl ExclusiveMemoryPool {
     /// Finds a free page that can contain the given size
     /// Returns a slice on that page if successful.
     fn get_free_page(&mut self, size: u64) -> Option<&mut MemoryPage> {
-        // Return the smallest free page that fits.
-        self.pages
-            .iter_mut()
-            .filter(|page| page.alloc_size >= size && page.slice.is_free())
-            .min_by_key(|page| page.free_count)
+        let mut best: Option<&mut MemoryPage> = None;
+        for page in &mut self.pages {
+            if page.alloc_size < size || !page.slice.is_free() {
+                continue;
+            }
+            // A fitting free page at zero already has the lowest possible count.
+            if page.free_count == 0 {
+                return Some(page);
+            }
+            if best
+                .as_ref()
+                .is_none_or(|old| page.free_count < old.free_count)
+            {
+                best = Some(page);
+            }
+        }
+        best
     }
 
     fn alloc_page<Storage: ComputeStorage>(
@@ -255,5 +267,37 @@ impl MemoryPool for ExclusiveMemoryPool {
             })?;
 
         Ok(&page.slice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::BytesStorage;
+
+    #[test]
+    fn reuse_selects_the_first_fitting_free_page_of_minimum_count() {
+        let mut pool = ExclusiveMemoryPool::new(256, 1, 100, 0);
+        let mut storage = BytesStorage::default();
+        let small = pool.alloc(&mut storage, 32).unwrap();
+        let live = pool.alloc(&mut storage, 256).unwrap().binding();
+        let first = pool.alloc(&mut storage, 192).unwrap();
+        let second = pool.alloc(&mut storage, 256).unwrap();
+        drop((small, first, second));
+
+        pool.pages[0].free_count = 0; // Too small for the requests below.
+        pool.pages[1].free_count = 0; // Still held by a binding.
+        for (first_count, second_count, expected) in [(3, 2, 3), (2, 2, 2), (2, 0, 3), (0, 0, 2)] {
+            pool.pages[2].free_count = first_count;
+            pool.pages[3].free_count = second_count;
+            let handle = pool.try_reserve(192).unwrap();
+            assert_eq!(handle.descriptor().page(), expected);
+        }
+
+        let last = pool.try_reserve(256).unwrap();
+        assert!(pool.try_reserve(256).is_none());
+        drop(live);
+        assert_eq!(pool.try_reserve(256).unwrap().descriptor().page(), 1);
+        drop(last);
     }
 }
