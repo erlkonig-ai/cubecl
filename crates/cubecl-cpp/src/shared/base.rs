@@ -382,7 +382,11 @@ impl<D: Dialect> CppCompiler<D> {
 
         let processing = scope.process(processors);
 
-        for var in processing.variables {
+        // The pool hands its variables out in hash order, which is random per
+        // process; declare them by id so that the emitted source is not.
+        let mut variables = processing.variables;
+        variables.sort_by_key(|var| var.index());
+        for var in variables {
             instructions.push(Instruction::DeclareVariable {
                 var: self.compile_variable(var),
             });

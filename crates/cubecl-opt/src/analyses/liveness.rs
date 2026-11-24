@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use cubecl_ir::Id;
 use petgraph::graph::NodeIndex;
@@ -185,7 +185,7 @@ pub mod shared {
         pub shared_memories: HashMap<Id, SharedMemory>,
         /// Map of allocations for each shared memory by its ID. Populated after the analysis, and
         /// should contain all memories from `shared_memories`.
-        pub allocations: HashMap<Id, SmemAllocation>,
+        pub allocations: BTreeMap<Id, SmemAllocation>,
     }
 
     impl Analysis for SharedLiveness {
@@ -247,7 +247,11 @@ pub mod shared {
         /// See also [`allocate_slice`]
         fn allocate_slices(&mut self, opt: &mut Optimizer) {
             for block in opt.node_ids() {
-                for live_smem in self.at_block(block).clone() {
+                // In id order: a layout that followed the set's random order would
+                // make each process emit different source for the same kernel.
+                let mut live_smems = self.at_block(block).iter().copied().collect::<Vec<_>>();
+                live_smems.sort_unstable();
+                for live_smem in live_smems {
                     if !self.allocations.contains_key(&live_smem) {
                         let smem = self.shared_memories[&live_smem];
                         let offset = self.allocate_slice(block, smem.size(), smem.align());

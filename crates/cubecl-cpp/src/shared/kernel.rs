@@ -168,7 +168,11 @@ pub fn type_vectorized_definitions<D: Dialect>(
     f: &mut std::fmt::Formatter<'_>,
     items: &HashSet<Item<D>>,
 ) -> std::fmt::Result {
-    for item in items.iter() {
+    // The set's order is random per process; the emitted source must not be, or
+    // a cache keyed on it never hits.
+    let mut items: Vec<_> = items.iter().collect();
+    items.sort_by_cached_key(|item| item.to_string());
+    for item in items {
         let elem = item.elem;
         let size = item.vectorization;
         let alignment = elem.size() * size;
