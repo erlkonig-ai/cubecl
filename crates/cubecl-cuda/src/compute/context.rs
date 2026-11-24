@@ -64,15 +64,19 @@ pub struct PtxCacheEntry {
 ///
 /// The toolkit is identified by its manifest, so reuse assumes that an installed
 /// toolkit does not change under an unchanged manifest: whoever edits its headers
-/// in place deletes the cache. Without a manifest there is no identity, and no key.
+/// in place deletes the cache. Without a manifest, or with a blank one, there is no
+/// identity, and no key.
 fn ptx_key(
     source: &str,
     options: &[&str],
     manifest: &std::path::Path,
 ) -> Result<Option<StableHash>, CompilationError> {
-    let Ok(toolkit) = std::fs::read(manifest) else {
-        log::warn!("The PTX cache is bypassed, no readable toolkit manifest at {manifest:?}");
-        return Ok(None);
+    let toolkit = match std::fs::read(manifest) {
+        Ok(toolkit) if !toolkit.trim_ascii().is_empty() => toolkit,
+        _ => {
+            log::warn!("The PTX cache is bypassed, no readable toolkit manifest at {manifest:?}");
+            return Ok(None);
+        }
     };
     let (mut major, mut minor, mut driver) = (0, 0, 0);
     let generic = |reason: String| CompilationError::Generic {
@@ -417,6 +421,10 @@ mod tests {
         let key = |source, options: &[&str]| ptx_key(source, options, &manifest).unwrap();
 
         assert!(key("a", &["-x", "-y"]).is_none(), "no manifest, no key");
+        for blank in ["", " \n\t\r\n"] {
+            std::fs::write(&manifest, blank).unwrap();
+            assert!(key("a", &["-x", "-y"]).is_none(), "{blank:?}: no key");
+        }
 
         std::fs::write(&manifest, "13.0").unwrap();
         let base = key("a", &["-x", "-y"]);

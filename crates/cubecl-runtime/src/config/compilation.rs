@@ -13,7 +13,7 @@ pub struct CompilationConfig {
     /// On CUDA an entry is reused for the same source, options, toolkit manifest
     /// (`version.json`), NVRTC and driver. That assumes an installed toolkit does not
     /// change under its manifest: after editing its headers in place, delete the
-    /// `ptx_by_source` files under this location. Without a readable manifest the
+    /// `ptx_by_source` files under this location. Without a readable, non-blank manifest the
     /// cache is bypassed. An entry that no longer loads is recompiled at every start
     /// and is not replaced; deleting the files clears it too.
     #[serde(default)]
